@@ -1,0 +1,551 @@
+# Guía manual: construir el sistema a mano en LocalStack (y llevarlo a AWS real)
+
+Todo con el AWS CLI, **sin los scripts del proyecto**. La idea es que entiendas cada pieza: cómo el CLI sabe si habla con LocalStack o con AWS real, cómo se crean y conectan SNS, SQS y las Lambdas, cómo probar cada tramo, cómo invocar una Lambda a mano y cómo conectar tu servidor. Los comandos son los **mismos** para LocalStack y para AWS real: lo único que cambia es el perfil del CLI y unos pocos valores, que se listan en la [parte 9](#9-pasar-a-aws-real).
+
+Arquitectura que se construye (detalle en `GUIA.md`):
+
+```
+SNS report-events ─┬─► SQS report-requests   (+DLQ) ──► Lambda report-request-recorder ──► Postgres
+ (filtro por type) └─► SQS report-generation (+DLQ) ──► Lambda report-generator ──► API de avisos
+```
+
+## Índice
+1. [Cómo sabe el CLI si va a LocalStack o a AWS real](#1-cómo-sabe-el-cli-si-va-a-localstack-o-a-aws-real)
+2. [Levantar LocalStack](#2-levantar-localstack)
+3. [Configurar el CLI hacia LocalStack](#3-configurar-el-cli-hacia-localstack)
+4. [SNS y SQS, y conectarlos](#4-sns-y-sqs-y-conectarlos)
+5. [Probar el tramo SNS → SQS antes de crear las Lambdas](#5-probar-el-tramo-sns--sqs)
+6. [Lambdas y sus triggers](#6-lambdas-y-sus-triggers)
+7. [Invocar una Lambda a mano y ver sus logs](#7-invocar-una-lambda-a-mano-y-ver-sus-logs)
+8. [Conectar tu servidor a LocalStack](#8-conectar-tu-servidor-a-localstack)
+9. [Pasar a AWS real](#9-pasar-a-aws-real)
+10. [Inspeccionar, depurar y limpiar](#10-inspeccionar-depurar-y-limpiar)
+11. [Errores frecuentes](#11-errores-frecuentes)
+12. [Resumen: local frente a real](#12-resumen-local-frente-a-real)
+
+> **Shell:** los bloques usan bash (Mac, Linux, Git Bash o WSL en Windows). Las *heredocs* (`<<EOF`) y las comillas no funcionan igual en PowerShell: en Windows, usa Git Bash o WSL, o crea los archivos JSON con un editor.
+
+---
+
+## 1. Cómo sabe el CLI si va a LocalStack o a AWS real
+
+El AWS CLI **no sabe nada de LocalStack**. Por defecto habla con `https://<servicio>.<región>.amazonaws.com`, o sea con AWS real. Para que hable con otra dirección hay que decírselo explícitamente. Hay cuatro formas, de mayor a menor prioridad:
+
+| Forma | Alcance | Ejemplo |
+|---|---|---|
+| 1. Opción en el comando | Un solo comando | `aws sns list-topics --endpoint-url http://localhost:4566` |
+| 2. Variable de entorno de un servicio | Esa terminal, un servicio | `export AWS_ENDPOINT_URL_SNS=http://localhost:4566` |
+| 3. Variable de entorno global | Esa terminal, todo | `export AWS_ENDPOINT_URL=http://localhost:4566` |
+| 4. `endpoint_url` en un **perfil** | Cada vez que uses ese perfil | `aws --profile localstack …` |
+
+Sin ninguna de las cuatro, el CLI va a AWS real con las credenciales que tenga configuradas.
+
+**Mi recomendación: usa un perfil dedicado (la forma 4).** Resuelve los dos peligros a la vez:
+- **No hay riesgo de tocar AWS real por error.** El perfil `localstack` solo tiene claves falsas (`test`/`test`): aunque olvides el endpoint, AWS real rechazaría esas credenciales.
+- **No hay que repetir `--endpoint-url`** en cada comando.
+
+Es peligrosa la forma 3 si la dejas puesta: una terminal con `AWS_ENDPOINT_URL` exportado manda *todos* tus comandos a LocalStack hasta que la cierres, y te puede confundir ("¿por qué no veo mis recursos reales?"). La inversa también es peligrosa: usar tus credenciales reales (el perfil `default`) y olvidar el endpoint crea recursos **en tu cuenta real**.
+
+**Cómo comprobar dónde estás, siempre antes de crear nada:**
+```bash
+aws sts get-caller-identity
+```
+- Cuenta `000000000000` → LocalStack.
+- Tu cuenta real (12 dígitos distintos) → AWS real.
+
+Hazlo un hábito: es el equivalente de mirar en qué base de datos estás conectado.
+
+> Alternativa: `pip install awscli-local` instala el comando `awslocal`, que es el `aws` con el endpoint de LocalStack ya puesto. Funciona igual, pero esta guía usa el `aws` normal para que se vea qué está pasando.
+
+---
+
+## 2. Levantar LocalStack
+Necesitas Docker abierto.
+```bash
+docker run -d --name localstack \
+  -p 127.0.0.1:4566:4566 \
+  -e SERVICES=sns,sqs,lambda,logs,iam,sts \
+  -e LAMBDA_DOCKER_FLAGS="--add-host=host.docker.internal:host-gateway" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  localstack/localstack:3.8.1
+```
+- `-p 127.0.0.1:4566:4566`: todo LocalStack escucha en un solo puerto, y solo en tu máquina.
+- `SERVICES=…`: solo los servicios que usamos.
+- `-v /var/run/docker.sock…`: LocalStack ejecuta cada Lambda en **otro contenedor**, por eso necesita hablar con Docker.
+- `LAMBDA_DOCKER_FLAGS`: permite que las Lambdas alcancen servicios de tu máquina con el nombre `host.docker.internal` (en Linux hace falta; en Docker Desktop ya existe).
+- La versión está fijada porque las más recientes pueden exigir un token.
+
+El repo trae lo mismo en `local/docker-compose.yml` (`docker compose -f local/docker-compose.yml up -d`).
+
+Comprueba que responde:
+```bash
+curl -s http://localhost:4566/_localstack/health
+```
+Debe mostrar un JSON con `sns`, `sqs` y `lambda` como `available` o `running`.
+
+**LocalStack no guarda nada entre reinicios.** Si apagas el contenedor (o reinicias Docker), pierdes topic, colas y Lambdas, y hay que recrearlos con esta guía.
+
+---
+
+## 3. Configurar el CLI hacia LocalStack
+
+Crea un perfil `localstack` con claves falsas y el endpoint:
+```bash
+aws configure set aws_access_key_id     test                   --profile localstack
+aws configure set aws_secret_access_key test                   --profile localstack
+aws configure set region                us-east-2              --profile localstack
+aws configure set endpoint_url          http://localhost:4566  --profile localstack
+```
+Eso escribe en `~/.aws/credentials` y `~/.aws/config`. Requiere AWS CLI v2.13 o superior (`aws --version`); en una anterior, usa `--endpoint-url` en cada comando.
+
+Actívalo **en esta terminal**:
+```bash
+export AWS_PROFILE=localstack
+```
+Y comprueba:
+```bash
+aws sts get-caller-identity
+aws configure list
+```
+Debes ver `"Account": "000000000000"`. `aws configure list` muestra de dónde sale cada valor (el perfil). Para volver a AWS real en esa terminal:
+```bash
+unset AWS_PROFILE
+```
+(o `export AWS_PROFILE=<tu-perfil-real>`). En PowerShell: `$env:AWS_PROFILE = 'localstack'` y `Remove-Item Env:AWS_PROFILE`.
+
+Variables que usará el resto de la guía:
+```bash
+export AWS_REGION=us-east-2
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+echo "$ACCOUNT_ID"          # 000000000000 en LocalStack
+```
+> En zsh, escribe siempre `${ACCOUNT_ID}` con llaves dentro de ARNs: `$ACCOUNT_ID:role` se interpreta como un modificador y rompe el texto.
+
+---
+
+## 4. SNS y SQS, y conectarlos
+
+### 4.1 El topic (SNS)
+```bash
+TOPIC_ARN=$(aws sns create-topic --name report-events --query TopicArn --output text)
+echo "$TOPIC_ARN"
+```
+Un **ARN** es el identificador único de un recurso. En LocalStack será `arn:aws:sns:us-east-2:000000000000:report-events`; en AWS real, el mismo con tu número de cuenta.
+
+### 4.2 Cada cola necesita cuatro pasos
+Para cada cola: **(1)** su DLQ, **(2)** la cola con la regla de reintentos, **(3)** permiso para que SNS escriba en ella, **(4)** la suscripción con el filtro. Los comandos usan la variable `$Q`: ejecuta el bloque completo una vez con `Q=report-requests` y otra con `Q=report-generation`.
+
+```bash
+Q=report-requests        # luego repite todo el bloque con Q=report-generation
+
+# 1) La DLQ: adonde van los mensajes que fallan demasiadas veces
+DLQ_URL=$(aws sqs create-queue --queue-name "$Q-dlq" --attributes MessageRetentionPeriod=1209600 --query QueueUrl --output text)
+DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ_URL" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+
+# 2) La cola. RedrivePolicy es JSON dentro de JSON, por eso los atributos van en un archivo.
+cat > attrs.json <<EOF
+{"VisibilityTimeout":"90","RedrivePolicy":"{\"deadLetterTargetArn\":\"$DLQ_ARN\",\"maxReceiveCount\":\"3\"}"}
+EOF
+Q_URL=$(aws sqs create-queue --queue-name "$Q" --attributes file://attrs.json --query QueueUrl --output text)
+Q_ARN=$(aws sqs get-queue-attributes --queue-url "$Q_URL" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+
+# 3) Permiso: SNS (solo este topic) puede escribir en la cola
+cat > policy.json <<EOF
+{"Policy":"{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"sns.amazonaws.com\"},\"Action\":\"sqs:SendMessage\",\"Resource\":\"$Q_ARN\",\"Condition\":{\"ArnEquals\":{\"aws:SourceArn\":\"$TOPIC_ARN\"}}}]}"}
+EOF
+aws sqs set-queue-attributes --queue-url "$Q_URL" --attributes file://policy.json
+
+# 4) La suscripción: conecta el topic con la cola, con un filtro
+aws sns subscribe --topic-arn "$TOPIC_ARN" --protocol sqs --notification-endpoint "$Q_ARN" \
+  --attributes '{"FilterPolicy":"{\"type\":[\"report.requested\"]}","FilterPolicyScope":"MessageBody","RawMessageDelivery":"false"}'
+```
+
+Guarda las direcciones de cada cola, que usarás más adelante. Hazlo justo después de cada ejecución del bloque:
+```bash
+# tras Q=report-requests:
+REQUESTS_URL=$Q_URL;   REQUESTS_ARN=$Q_ARN
+# tras Q=report-generation:
+GENERATION_URL=$Q_URL; GENERATION_ARN=$Q_ARN
+```
+
+**Qué significa cada parte:**
+- **`maxReceiveCount: 3`:** si la Lambda falla 3 veces con el mismo mensaje, SQS lo mueve a la DLQ en vez de reintentarlo para siempre. Se conserva 14 días.
+- **`VisibilityTimeout: 90`:** mientras una Lambda procesa un mensaje, queda oculto 90 s. Debe ser **mayor que el timeout de la Lambda** (15 s). Si fuera menor, otra Lambda podría tomar el mismo mensaje a la vez.
+- **`FilterPolicyScope: MessageBody`:** el filtro mira dentro del JSON del mensaje, no en sus atributos. Un mensaje llega solo si su campo `type` vale `report.requested`; los demás se descartan en silencio.
+- **`RawMessageDelivery: false`:** SNS envuelve el mensaje en un sobre `{"Type":"Notification","Message":"…"}`. Las Lambdas del proyecto lo desenvuelven. Con `true` llegaría el mensaje tal cual y habría que quitar ese desenvuelto.
+- **La política de la cola:** en LocalStack no se exige, pero **en AWS real es obligatoria**: sin ella SNS no puede escribir. Incluirla aquí evita que lo olvides al pasar a real.
+
+Los archivos `attrs.json` y `policy.json` se pisan en cada vuelta; puedes borrarlos al terminar.
+
+---
+
+## 5. Probar el tramo SNS → SQS
+Prueba esto **antes** de crear las Lambdas: si hay un error de conexión, es más fácil verlo sin ellas.
+
+**Un mensaje que cumple el filtro debe llegar a las dos colas:**
+```bash
+aws sns publish --topic-arn "$TOPIC_ARN" --message '{"type":"report.requested","body":{"requestId":"t1","requester":"yo@ejemplo.com","requesterId":"s1","reportType":"INVENTORY","params":{},"requestedAt":"2026-01-01T00:00:00Z"}}'
+
+aws sqs receive-message --queue-url "$REQUESTS_URL"   --wait-time-seconds 3
+aws sqs receive-message --queue-url "$GENERATION_URL" --wait-time-seconds 3
+```
+Verás el sobre de SNS en el campo `Body`: `{"Type":"Notification","MessageId":…,"Message":"{\"type\":\"report.requested\",…}"}`. Es lo que recibirán las Lambdas.
+
+**Un mensaje de otro tipo no debe llegar:**
+```bash
+aws sns publish --topic-arn "$TOPIC_ARN" --message '{"type":"otro","body":{}}'
+aws sqs receive-message --queue-url "$REQUESTS_URL" --wait-time-seconds 3
+```
+La respuesta debe estar vacía: el filtro lo descartó.
+
+**Limpia las colas** para que esos mensajes de prueba no los procesen las Lambdas cuando las crees:
+```bash
+aws sqs purge-queue --queue-url "$REQUESTS_URL"
+aws sqs purge-queue --queue-url "$GENERATION_URL"
+```
+(SQS limita `purge-queue` a una vez por minuto por cola en AWS real.)
+
+---
+
+## 6. Lambdas y sus triggers
+
+### 6.1 Empaquetar
+Una Lambda de Node se sube como un `.zip` con el código y sus dependencias (`node_modules`):
+```bash
+(cd lambdas/pg/report-request-recorder && npm ci --omit=dev && zip -r ../recorder.zip .)
+(cd lambdas/pg/report-generator        && npm ci --omit=dev && zip -r ../generator.zip .)
+```
+En Windows, sin `zip`: `tar -a -c -f ../recorder.zip *` (desde dentro de la carpeta), o *Compress-Archive* de PowerShell.
+
+### 6.2 El rol
+Toda Lambda se ejecuta con un **rol de IAM**. **LocalStack no valida el rol**: basta con un ARN con la forma correcta, sin crear nada.
+```bash
+ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/lambda-role"
+```
+En AWS real el rol **sí debe existir**, con permisos. Se explica en la [parte 9](#9-pasar-a-aws-real).
+
+### 6.3 Las variables de entorno
+Se pasan en un archivo, porque las URLs de conexión tienen símbolos que rompen la sintaxis corta del CLI.
+
+**`report-request-recorder`** (guarda la solicitud en Postgres). Dentro del contenedor de la Lambda, `localhost` es el propio contenedor, por eso se usa `host.docker.internal` para alcanzar el Postgres de tu máquina:
+```bash
+cat > env-recorder.json <<'EOF'
+{"Variables":{"DATABASE_URL":"postgresql://USUARIO@host.docker.internal:5432/reports_local","DATABASE_SSL":"false"}}
+EOF
+```
+**`report-generator`** (lee los productos y publica el aviso). Con `NOTIFY_MODE=log` solo imprime el aviso, sin llamar a la API real:
+```bash
+cat > env-generator.json <<'EOF'
+{"Variables":{"DATABASE_URL":"postgresql://USUARIO@host.docker.internal:5432/reports_local","DATABASE_SSL":"false","NOTIFY_MODE":"log"}}
+EOF
+```
+Reemplaza `USUARIO` por tu usuario de Postgres local. Si tu Postgres tiene contraseña: `postgresql://USUARIO:CLAVE@…`.
+
+### 6.4 Crear las funciones
+```bash
+aws lambda create-function --function-name report-request-recorder \
+  --runtime nodejs20.x --handler index.handler --timeout 15 --memory-size 128 \
+  --role "$ROLE_ARN" --zip-file fileb://lambdas/pg/recorder.zip --environment file://env-recorder.json
+
+aws lambda create-function --function-name report-generator \
+  --runtime nodejs20.x --handler index.handler --timeout 15 --memory-size 128 \
+  --role "$ROLE_ARN" --zip-file fileb://lambdas/pg/generator.zip --environment file://env-generator.json
+```
+- `--handler index.handler`: el archivo `index.js` y la función exportada `handler`.
+- `--timeout 15`: máximo 15 s por ejecución (debe ser menor que el `VisibilityTimeout` de la cola).
+- `fileb://`: lee el zip como binario (con `file://` fallaría).
+
+Espera a que estén listas:
+```bash
+aws lambda wait function-active-v2 --function-name report-request-recorder
+aws lambda wait function-active-v2 --function-name report-generator
+aws lambda get-function --function-name report-generator --query 'Configuration.[State,LastUpdateStatus]' --output text
+```
+Debe decir `Active  Successful`. La primera vez, LocalStack descarga la imagen de runtime y puede tardar.
+
+### 6.5 Los triggers (event source mappings)
+Un *event source mapping* hace que AWS lea una cola por ti y llame a la Lambda con lotes de mensajes. Tú no escribes ningún código de lectura.
+```bash
+aws lambda create-event-source-mapping --function-name report-request-recorder \
+  --event-source-arn "$REQUESTS_ARN"   --batch-size 5
+
+aws lambda create-event-source-mapping --function-name report-generator \
+  --event-source-arn "$GENERATION_ARN" --batch-size 5
+```
+Compruébalos:
+```bash
+aws lambda list-event-source-mappings \
+  --query 'EventSourceMappings[].[FunctionArn,EventSourceArn,State]' --output table
+```
+Deben estar `Enabled`. `--batch-size 5` significa que la Lambda recibe hasta 5 mensajes por invocación. Si la Lambda lanza un error, **todo el lote** vuelve a la cola y cuenta como un intento: por eso las Lambdas son idempotentes.
+
+### 6.6 Actualizar el código o las variables
+Tras cambiar el código, no hace falta recrear nada:
+```bash
+aws lambda update-function-code --function-name report-generator --zip-file fileb://lambdas/pg/generator.zip
+aws lambda wait function-updated --function-name report-generator
+aws lambda update-function-configuration --function-name report-generator --environment file://env-generator.json
+```
+> `update-function-configuration --environment` **reemplaza todas** las variables, no agrega: siempre envía el conjunto completo.
+
+### 6.7 Recrear una Lambda en LocalStack
+Si borras una función y la recreas, borra **antes** su mapeo; si no, LocalStack responde `ResourceConflictException` porque el mapeo viejo sigue existiendo:
+```bash
+aws lambda list-event-source-mappings --event-source-arn "$REQUESTS_ARN" --query 'EventSourceMappings[].UUID' --output text
+aws lambda delete-event-source-mapping --uuid <UUID>
+aws lambda delete-function --function-name report-request-recorder
+```
+
+---
+
+## 7. Invocar una Lambda a mano y ver sus logs
+
+### 7.1 Con un evento falso
+Una Lambda conectada a SQS recibe un evento con una lista `Records`, cada uno con el mensaje en `body`. Puedes fabricarlo a mano. El `body` es un **string** que contiene el JSON del mensaje (por eso las comillas internas van escapadas). Las Lambdas del proyecto aceptan el mensaje directo o dentro del sobre de SNS:
+```bash
+cat > event.json <<'EOF'
+{"Records":[{"messageId":"m1","body":"{\"type\":\"report.requested\",\"body\":{\"requestId\":\"manual-1\",\"requester\":\"yo@ejemplo.com\",\"requesterId\":\"s1\",\"reportType\":\"INVENTORY\",\"params\":{},\"requestedAt\":\"2026-01-01T00:00:00Z\"}}"}]}
+EOF
+
+aws lambda invoke --function-name report-generator \
+  --cli-binary-format raw-in-base64-out --payload file://event.json \
+  --log-type Tail --query LogResult --output text response.json | base64 --decode
+
+cat response.json
+```
+- `--cli-binary-format raw-in-base64-out`: obligatorio en CLI v2 para pasar JSON "tal cual" (si no, lo interpreta como base64 y falla con *Invalid base64*).
+- `--log-type Tail`: devuelve las últimas líneas del log de esa invocación, en base64; `base64 --decode` las lee. (En macOS antiguo, `base64 -D`. En PowerShell: `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($texto))`.)
+- `response.json`: lo que devuelve la función.
+
+Si la función **lanza un error**, la invocación igual "funciona" (HTTP 200) pero el resultado trae `FunctionError`. Mira la respuesta completa, sin `--query`:
+```bash
+aws lambda invoke --function-name report-generator --cli-binary-format raw-in-base64-out --payload file://event.json response.json
+cat response.json        # {"errorType":"Error","errorMessage":"…"}
+```
+Para invocarla sin esperar el resultado: `--invocation-type Event`.
+
+Esto prueba la Lambda **aislada**, sin colas ni SNS: ideal para depurar su lógica.
+
+### 7.2 Con el flujo real
+Publica en SNS y deja que las colas y los triggers hagan su trabajo:
+```bash
+aws sns publish --topic-arn "$TOPIC_ARN" --message '{"type":"report.requested","body":{"requestId":"flujo-1","requester":"yo@ejemplo.com","requesterId":"s1","reportType":"INVENTORY","params":{},"requestedAt":"2026-01-01T00:00:00Z"}}'
+```
+Espera unos segundos y mira los logs.
+
+### 7.3 Logs
+Cada Lambda escribe en el grupo `/aws/lambda/<nombre>`:
+```bash
+aws logs tail /aws/lambda/report-generator --since 10m
+aws logs tail /aws/lambda/report-request-recorder --since 10m
+```
+Si `tail` no funciona en tu versión de LocalStack:
+```bash
+aws logs filter-log-events --log-group-name /aws/lambda/report-generator --query 'events[].message' --output text
+```
+Y verifica en la base que el recorder guardó la fila:
+```bash
+psql reports_local -P pager=off -c "SELECT id, requester, type, requested_at FROM report_requests ORDER BY requested_at DESC LIMIT 3;"
+```
+(la tabla `report_requests` la crea el BFF al arrancar, o créala a mano con el SQL de `GUIA.md`, parte 1).
+
+---
+
+## 8. Conectar tu servidor a LocalStack
+
+**El código del servidor no cambia entre local y producción.** Lo que decide a dónde habla el SDK de AWS son variables de entorno, la misma lógica que el CLI:
+
+| Variable | En local | En AWS real |
+|---|---|---|
+| `AWS_ENDPOINT_URL` | `http://localhost:4566` | **no se define** |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `test` / `test` | **no se definen**: usa el rol de la instancia EC2 |
+| `AWS_REGION` | `us-east-2` | `us-east-2` |
+| `SNS_TOPIC_ARN` | `arn:aws:sns:us-east-2:000000000000:report-events` | el ARN real |
+
+Todos los SDK modernos respetan `AWS_ENDPOINT_URL` (Java v2 ≥ 2.21, JavaScript v3, Python boto3, Go v2…). El BFF de este proyecto (Spring Boot, SDK v2 2.29) crea sus clientes sin endpoint ni claves en el código, así que basta con el entorno:
+
+```bash
+cd bff
+AWS_ENDPOINT_URL=http://localhost:4566 \
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-2 \
+SNS_TOPIC_ARN=arn:aws:sns:us-east-2:000000000000:report-events \
+DB_URL=jdbc:postgresql://localhost:5432/reports_local DB_USER=USUARIO DB_PASSWORD= \
+SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI=http://localhost:9000 \
+./gradlew bootRun
+```
+En PowerShell, las variables se definen antes: `$env:AWS_ENDPOINT_URL='http://localhost:4566'` (una línea por variable) y se ejecuta `.\gradlew.bat bootRun`.
+
+La última variable apunta la validación del JWT a un OIDC local en lugar de Cognito (`node scripts/local/mock-oidc.js`, o cualquier servidor OIDC); es la única parte de este paso que usa un script del proyecto. Si prefieres un token real de Cognito, no definas esa variable y envía un `id_token` válido en `Authorization: Bearer`.
+
+**Probar que el servidor publica:** llama a su endpoint, y luego mira las colas o los logs de las Lambdas:
+```bash
+curl -i -X POST http://localhost:8080/api/reports \
+  -H "Authorization: Bearer $TOKEN" -H "X-Secret-Gateway: secreto_local" -H "Content-Type: application/json" \
+  -d '{"type":"INVENTORY","params":{}}'
+```
+Debe responder `202 Accepted` con un `requestId`.
+
+**Qué NO debe llegar nunca a producción:** `AWS_ENDPOINT_URL`, las claves `test`, `NOTIFY_MODE=log`, `DATABASE_SSL=false` y el `…ISSUER_URI` local. En el despliegue real, el contenedor del BFF se inicia sin ellas (mira `deploy.yml`: solo define las de producción).
+
+---
+
+## 9. Pasar a AWS real
+Con la guía hecha en local, pasar a real consiste en **repetir los mismos comandos con otro perfil** y cambiar lo que se lista aquí.
+
+**Antes de empezar, confirma dónde estás:**
+```bash
+unset AWS_PROFILE              # o: export AWS_PROFILE=<tu-perfil-real>
+aws sts get-caller-identity    # debe mostrar TU cuenta real, no 000000000000
+aws configure list
+```
+
+| Qué | LocalStack | AWS real |
+|---|---|---|
+| Perfil del CLI | `localstack` (claves `test`, con endpoint) | tu perfil real, **sin** `endpoint_url` |
+| Cuenta en los ARN | `000000000000` | tu número de cuenta (`$ACCOUNT_ID` lo recoge solo) |
+| Rol de la Lambda | un ARN ficticio basta | **debe existir**, con permisos (abajo) |
+| Política de la cola para SNS | opcional | **obligatoria** (ya está en el paso 4) |
+| Runtime | `nodejs20.x` | `nodejs22.x` |
+| `DATABASE_URL` de las Lambdas | `…@host.docker.internal:5432/…` | la de Supabase |
+| `DATABASE_SSL` | `false` | no se define (SSL activo) |
+| `NOTIFY_MODE` en el generador | `log` | no se define; en su lugar, `API_NOTIFICATION` y `API_TOKEN_INTEGRATION` |
+| Credenciales del servidor | claves `test` | el rol de la instancia EC2 |
+
+### 9.1 Los roles de las Lambdas (solo en AWS real)
+Un rol por Lambda, con lo mínimo: escribir logs y leer **su** cola.
+```bash
+TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+for PAIR in report-request-recorder:report-requests report-generator:report-generation; do
+  FN=${PAIR%%:*}; Q=${PAIR##*:}
+  aws iam create-role --role-name "$FN-role" --assume-role-policy-document "$TRUST"
+  aws iam attach-role-policy --role-name "$FN-role" \
+    --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  aws iam put-role-policy --role-name "$FN-role" --policy-name "consume-$Q" --policy-document \
+    "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"sqs:ReceiveMessage\",\"sqs:DeleteMessage\",\"sqs:GetQueueAttributes\"],\"Resource\":\"arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:$Q\"}]}"
+done
+sleep 12      # el rol tarda unos segundos en propagarse; sin esperar, create-function puede fallar
+```
+Y en la parte 6.4, usa `--role "arn:aws:iam::${ACCOUNT_ID}:role/report-request-recorder-role"` (y `…/report-generator-role` para el otro), con `--runtime nodejs22.x` y las variables reales.
+
+### 9.2 Variables del generador en real
+```bash
+cat > env-generator.json <<'EOF'
+{"Variables":{"API_NOTIFICATION":"https://TU-APP/","API_TOKEN_INTEGRATION":"crr_...","DATABASE_URL":"postgresql://USUARIO:CLAVE@HOST:5432/postgres"}}
+EOF
+```
+Bórralo al terminar (`rm env-generator.json`): tiene secretos.
+
+### 9.3 El servidor en AWS real
+- El servidor corre en una EC2 con un **rol de instancia**. Ese rol necesita permiso para publicar en el topic:
+```bash
+aws iam put-role-policy --role-name <ROL_DE_LA_EC2> --policy-name publish-report-events --policy-document \
+  "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"sns:Publish\",\"Resource\":\"$TOPIC_ARN\"}]}"
+```
+- Si corre dentro de un contenedor Docker, el servicio de metadatos de la instancia debe aceptar 2 saltos de red, o el contenedor no obtiene las credenciales del rol:
+```bash
+aws ec2 describe-instances --instance-ids <INSTANCE_ID> --query 'Reservations[].Instances[].MetadataOptions.HttpPutResponseHopLimit'
+aws ec2 modify-instance-metadata-options --instance-id <INSTANCE_ID> --http-put-response-hop-limit 2    # solo si no es 2 o más
+```
+
+### 9.4 Después: GitHub Actions mantiene el código
+La primera vez creas todo a mano (esta guía). Después, los workflows de cada repo actualizan el **código** con `update-function-code`; no recrean nada. Por eso los nombres de las funciones deben coincidir con los secrets `LAMBDA_RECORDER_FUNCTION_NAME` y `LAMBDA_GENERATOR_FUNCTION_NAME` (ver `GUIA.md`, parte 5).
+
+### 9.5 Prueba de humo en real
+Es el mismo `publish` de la parte 7.2, con tu perfil real. Ojo: en real el generador **publica un aviso de verdad** en la API de avisos.
+```bash
+aws sns publish --topic-arn "$TOPIC_ARN" --message '{"type":"report.requested","body":{"requestId":"smoke-1","requester":"yo@ejemplo.com","requesterId":"s1","reportType":"INVENTORY","params":{},"requestedAt":"2026-01-01T00:00:00Z"}}'
+aws logs tail /aws/lambda/report-generator --since 5m
+```
+
+---
+
+## 10. Inspeccionar, depurar y limpiar
+
+**Ver qué existe:**
+```bash
+aws sns list-topics
+aws sns list-subscriptions-by-topic --topic-arn "$TOPIC_ARN" \
+  --query 'Subscriptions[].[Endpoint,SubscriptionArn]' --output table
+aws sqs list-queues
+aws lambda list-functions --query 'Functions[].[FunctionName,Runtime,State]' --output table
+```
+
+**Cuántos mensajes hay en una cola** (la cifra es aproximada):
+```bash
+aws sqs get-queue-attributes --queue-url "$REQUESTS_URL" \
+  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
+```
+`NotVisible` son los que una Lambda está procesando ahora.
+
+**Mirar la DLQ** (mensajes que fallaron 3 veces) y entender por qué:
+```bash
+DLQ_URL=$(aws sqs get-queue-url --queue-name report-requests-dlq --query QueueUrl --output text)
+aws sqs receive-message --queue-url "$DLQ_URL" --wait-time-seconds 3
+```
+Combina el contenido con el log de la Lambda para ver el error.
+
+**Reenviar la DLQ a su cola** (cuando ya arreglaste el problema), solo en AWS real:
+```bash
+aws sqs start-message-move-task --source-arn <ARN_DE_LA_DLQ> --destination-arn "$REQUESTS_ARN"
+```
+O purga lo que no necesites: `aws sqs purge-queue --queue-url "$DLQ_URL"`.
+
+**Ver los logs de LocalStack** (cuando algo no arranca):
+```bash
+docker logs --tail 100 localstack
+```
+
+**Limpiar en LocalStack** (equivale a empezar de cero, porque no guarda estado):
+```bash
+docker rm -f localstack
+```
+
+**Limpiar un recurso concreto** (orden inverso a la creación):
+```bash
+aws lambda delete-event-source-mapping --uuid <UUID>
+aws lambda delete-function --function-name report-generator
+aws sns unsubscribe --subscription-arn <SUBSCRIPTION_ARN>
+aws sqs delete-queue --queue-url "$REQUESTS_URL"
+aws sns delete-topic --topic-arn "$TOPIC_ARN"
+```
+
+---
+
+## 11. Errores frecuentes
+
+| Mensaje o síntoma | Causa | Solución |
+|---|---|---|
+| `Could not connect to the endpoint URL: "http://localhost:4566/"` | LocalStack no está corriendo | `docker ps` y repetir la parte 2 |
+| Los comandos no encuentran tus recursos reales, o ves `000000000000` sin querer | Perfil o endpoint equivocado | `aws sts get-caller-identity`; revisa `AWS_PROFILE` y `AWS_ENDPOINT_URL` |
+| `The security token included in the request is invalid` en AWS real | Estás usando las claves `test` contra AWS real | `unset AWS_PROFILE` o selecciona tu perfil real |
+| `Invalid base64` al usar `invoke --payload` | Falta `--cli-binary-format raw-in-base64-out` | Agregarlo (CLI v2) |
+| `ResourceConflictException` al crear un mapeo | Quedó un mapeo anterior | Borrarlo (parte 6.7) |
+| `InvalidParameterValueException: The role defined for the function cannot be assumed` (AWS real) | El rol no existe o aún no se propaga | Crear el rol (9.1) y esperar 10 segundos |
+| El mensaje no llega a una cola | El filtro no coincide, o falta la política de la cola | `receive-message` de la parte 5; revisa el `type` y el scope `MessageBody` |
+| La Lambda falla con `ECONNREFUSED` al conectarse a Postgres (local) | Usa `localhost`, que dentro del contenedor es él mismo | `host.docker.internal` en `DATABASE_URL` |
+| La Lambda falla con `no pg_hba.conf entry` o por SSL (local) | Postgres local no usa SSL | `DATABASE_SSL=false` |
+| `relation "report_requests" does not exist` | La tabla aún no existe | Crearla con el SQL de `GUIA.md` (parte 1), o arrancar el BFF |
+| El mensaje reaparece en la cola una y otra vez | La Lambda lanza un error | `aws logs tail` y corregir; tras 3 intentos va a la DLQ |
+| `sqs receive-message` devuelve vacío tras publicar | Aún no llegó, o ya lo consumió una Lambda | Prueba antes de crear los mapeos (parte 5) |
+
+---
+
+## 12. Resumen: local frente a real
+
+```
+LOCAL                                   AWS REAL
+─────                                   ────────
+export AWS_PROFILE=localstack           unset AWS_PROFILE  (o tu perfil real)
+ └ endpoint http://localhost:4566        └ sin endpoint_url
+ └ claves test / test                    └ tus credenciales
+cuenta 000000000000                     tu cuenta
+rol de Lambda: ARN ficticio             rol real con permisos (9.1)
+política de cola: opcional              política de cola: obligatoria
+nodejs20.x                              nodejs22.x
+DB: host.docker.internal, sin SSL       DB: Supabase, con SSL
+NOTIFY_MODE=log                         API_NOTIFICATION + API_TOKEN_INTEGRATION
+servidor: AWS_ENDPOINT_URL + claves     servidor: rol de la instancia, sin esas variables
+```
+
+**La regla de oro:** los comandos y el código son idénticos; lo que cambia es **a quién le hablas** (decidido por el perfil o por variables de entorno) y **con qué identidad** (claves de mentira o rol real). Antes de cualquier comando que cree o borre, ejecuta `aws sts get-caller-identity`.

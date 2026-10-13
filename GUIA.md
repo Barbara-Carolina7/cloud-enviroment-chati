@@ -37,6 +37,7 @@ El repo **#1 es el punto de entrada**: contiene las instrucciones y las herramie
 | Entender qué hace el sistema | 1 |
 | Montar el proyecto en una máquina nueva | 2, luego 6 |
 | Programar y probar sin tocar AWS | 6 |
+| Construir todo a mano en LocalStack, entendiendo cada comando | [GUIA-LOCALSTACK-MANUAL.md](GUIA-LOCALSTACK-MANUAL.md) |
 | Recrear la infraestructura en una cuenta de AWS | 3, 4 y 5 |
 | Algo no funciona | 8 |
 
@@ -381,6 +382,8 @@ Abre http://localhost:5173 y pulsa "Ingresar con Cognito": entra solo como `admi
 En local, el aviso del informe **solo se imprime** en el log del generador (`NOTIFY_MODE=log`); no llama a la API real salvo que definas `API_NOTIFICATION` y `API_TOKEN_INTEGRATION` en `local/.env`. Detalle en `local/README.md`.
 
 ### 6.2 Vía manual (qué hace cada pieza)
+> Para construir todo **comando por comando** (SNS, SQS, Lambdas, triggers), entender cómo el CLI elige entre LocalStack y AWS real, invocar una Lambda a mano y pasar a producción, usa la guía dedicada: **[GUIA-LOCALSTACK-MANUAL.md](GUIA-LOCALSTACK-MANUAL.md)**. Lo que sigue es solo un resumen.
+
 **a) LocalStack** (`local/docker-compose.yml`): imagen `localstack/localstack:3.8.1` (las recientes pueden exigir token), servicios `sns,sqs,lambda,logs,iam,sts`, puerto `127.0.0.1:4566`, montando `/var/run/docker.sock` y con `LAMBDA_DOCKER_FLAGS=--add-host=host.docker.internal:host-gateway`.
 ```bash
 docker compose -f local/docker-compose.yml up -d
