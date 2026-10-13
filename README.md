@@ -13,13 +13,18 @@ Variables de entorno y secrets: [ENV.md](ENV.md). Comandos: [comandos.md](comand
 | `bff/`, `lambdas/pg/`, `front/` | Repos de GitHub clonados (ver abajo). |
 | `ENV.md`, `comandos.md` | Variables de entorno y bitácora de comandos AWS. |
 
-## Repos (clonados en este directorio)
+## Los 4 repositorios
 
-| Carpeta | Repo | Qué es |
-|---|---|---|
-| `bff/` | `docentedev/cloud-chati-bff` | Spring Boot (Java 21). CRUD de productos directo a Supabase; `POST /api/reports` publica en SNS. |
-| `lambdas/pg/` | `docentedev/cloud-lambda-pg` | `report-request-recorder/` y `report-generator/` (Node). |
-| `front/` | `docentedev/cloud-s3-chati` | React + Vite, servido por S3 + CloudFront, login con Cognito. |
+Todo el proyecto vive en cuatro repositorios de GitHub, de la cuenta `docentedev`. Cada uno se versiona y se despliega por separado. Cómo clonarlos, en la [GUIA.md](GUIA.md#22-clonar-los-repositorios).
+
+| # | Repositorio | Carpeta local | Qué es |
+|---|---|---|---|
+| 1 | [cloud-enviroment-chati](https://github.com/docentedev/cloud-enviroment-chati) | `AWS/` (raíz) | Este repo: documentación, scripts multiplataforma (`npm run …`) y stack local. **Punto de entrada.** |
+| 2 | [cloud-lambda-pg](https://github.com/docentedev/cloud-lambda-pg) | `lambdas/pg/` | Las dos Lambdas: `report-request-recorder/` y `report-generator/` (Node). |
+| 3 | [cloud-s3-chati](https://github.com/docentedev/cloud-s3-chati) | `front/` | React + Vite, servido por S3 + CloudFront, login con Cognito. |
+| 4 | [cloud-chati-bff](https://github.com/docentedev/cloud-chati-bff) | `bff/` | Spring Boot (Java 21): CRUD de productos directo a Supabase y `POST /api/reports`, que publica en SNS. |
+
+Los repos #2, #3 y #4 están dentro de la carpeta del #1, pero cada uno tiene su propio `.git`; el #1 los ignora.
 
 ## Arquitectura
 

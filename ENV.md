@@ -72,7 +72,7 @@ Lo leen los scripts de `scripts/` (`config.js` carga `local/.env` y después `.e
 | `API_NOTIFICATION` | URL del sitio de la app (ej. `https://TU-APP/`). Los scripts publican en `POST {URL}/api/saas/notices`. |
 | `API_TOKEN_INTEGRATION` | API key `crr_…`. Secreto. |
 
-Para probarlas sin pasar por AWS: `npm run notify:test` (ver más abajo en `GUIA.md`, sección 6).
+Para probarlas sin pasar por AWS: `npm run notify:test` (ver `GUIA.md`, sección 7).
 
 ## Front (S3 + CloudFront)
 
