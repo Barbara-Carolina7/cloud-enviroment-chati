@@ -1,0 +1,29 @@
+{
+  "name": "aws-chati-tooling",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Comandos multiplataforma (Mac, Linux, Windows) para el stack local y utilidades de la base de datos",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "local:up": "node scripts/local/up.js",
+    "local:init": "node scripts/local/init.js",
+    "local:dev": "node scripts/local/dev.js",
+    "local:oidc": "node scripts/local/mock-oidc.js",
+    "local:send-test": "node scripts/local/send-test.js",
+    "local:down": "node scripts/local/down.js",
+    "db:schema": "node scripts/local/db-schema.js",
+    "db:check": "node scripts/db-check.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch-logs": "^3.1150.0",
+    "@aws-sdk/client-lambda": "^3.1150.0",
+    "@aws-sdk/client-sns": "^3.1150.0",
+    "@aws-sdk/client-sqs": "^3.1150.0",
+    "adm-zip": "^0.6.1",
+    "oauth2-mock-server": "^9.2.0",
+    "pg": "^8.23.1"
+  }
+}

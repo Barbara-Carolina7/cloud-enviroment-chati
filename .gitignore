@@ -1,0 +1,108 @@
+# ============================================================
+# Este repo documenta y orquesta el entorno. NO debe contener
+# secretos, llaves ni datos de cuentas. Ante la duda, se ignora.
+# ============================================================
+
+# --- Repos independientes clonados aquí (cada uno tiene su propio .git y su remoto) ---
+/bff/
+/front/
+/lambdas/
+
+# --- Secretos y variables de entorno (cualquier nivel) ---
+.env
+.env.*
+*.env
+!.env.example
+!**/.env.example
+.envrc
+secrets/
+secret*.json
+*secret*
+*password*
+*credential*
+.netrc
+
+# --- Llaves, certificados y tokens ---
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.ppk
+*.crt
+*.cer
+*.csr
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.gpg
+*.asc
+.ssh/
+.gnupg/
+
+# --- Credenciales y configuración local de nubes y CLIs ---
+.aws/
+.azure/
+.gcloud/
+.config/gcloud/
+.kube/
+.docker/
+.npmrc
+.pypirc
+.git-credentials
+.vault-token
+
+# --- Estado de infraestructura y archivos que suelen contener secretos ---
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+*.auto.tfvars
+cdk.out/
+.serverless/
+.aws-sam/
+samconfig.toml
+
+# --- Volcados de datos, backups y salidas de comandos ---
+*.sql.gz
+*.dump
+*.bak
+*.backup
+*.sqlite
+*.sqlite3
+*.db
+dump*.sql
+backup*.sql
+*.csv
+*.log
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+out/
+output/
+tmp/
+temp/
+
+# --- Dependencias y artefactos de build ---
+node_modules/
+dist/
+build/
+coverage/
+.gradle/
+*.jar
+*.class
+
+# --- Herramientas y editores (config de sesión, historial, caché) ---
+.claude/
+.cursor/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+.cache/
+.npm/

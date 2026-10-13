@@ -1,0 +1,16 @@
+# Emula SNS, SQS y Lambda en local. La base de datos NO se emula: se usa la de DATABASE_URL (local/.env).
+# Versión fijada: las imágenes recientes de LocalStack pueden exigir LOCALSTACK_AUTH_TOKEN.
+# Se maneja con: npm run local:up / local:down (desde la raíz del proyecto).
+services:
+  localstack:
+    image: localstack/localstack:3.8.1
+    ports:
+      - "127.0.0.1:4566:4566"
+    environment:
+      - SERVICES=sns,sqs,lambda,logs,iam,sts
+      - DEBUG=0
+      # Docker Desktop (Mac/Windows) ya define host.docker.internal; en Linux hay que mapearlo para que
+      # la Lambda alcance una base de datos que corre en tu máquina.
+      - LAMBDA_DOCKER_FLAGS=--add-host=host.docker.internal:host-gateway
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
