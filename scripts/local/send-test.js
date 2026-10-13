@@ -32,10 +32,10 @@ async function waitForLogs(fn, timeoutMs = 120000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     try {
-      const out = await logs.send(
-        new FilterLogEventsCommand({ logGroupName: `/aws/lambda/${fn}`, filterPattern: `"${requestId}"` }),
-      )
-      if (out.events?.length) return out.events.map((e) => e.message.trim()).join('\n')
+      // LocalStack no aplica filterPattern de forma fiable: se filtra aquí por el requestId.
+      const out = await logs.send(new FilterLogEventsCommand({ logGroupName: `/aws/lambda/${fn}` }))
+      const mine = (out.events ?? []).filter((e) => e.message.includes(requestId))
+      if (mine.length) return mine.map((e) => e.message.trim()).join('\n')
     } catch {
       // el log group aún no existe
     }

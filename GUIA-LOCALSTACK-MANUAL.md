@@ -12,7 +12,7 @@ SNS report-events ─┬─► SQS report-requests   (+DLQ) ──► Lambda rep
 ## Índice
 1. [Cómo sabe el CLI si va a LocalStack o a AWS real](#1-cómo-sabe-el-cli-si-va-a-localstack-o-a-aws-real)
 2. [Levantar LocalStack](#2-levantar-localstack)
-3. [Configurar el CLI hacia LocalStack](#3-configurar-el-cli-hacia-localstack)
+3. [Configurar el CLI hacia LocalStack y primera prueba: una Lambda mínima](#3-configurar-el-cli-hacia-localstack-y-primera-prueba-una-lambda-mínima)
 4. [SNS y SQS, y conectarlos](#4-sns-y-sqs-y-conectarlos)
 5. [Probar el tramo SNS → SQS antes de crear las Lambdas](#5-probar-el-tramo-sns--sqs)
 6. [Lambdas y sus triggers](#6-lambdas-y-sus-triggers)
@@ -87,7 +87,9 @@ Debe mostrar un JSON con `sns`, `sqs` y `lambda` como `available` o `running`.
 
 ---
 
-## 3. Configurar el CLI hacia LocalStack
+## 3. Configurar el CLI hacia LocalStack y primera prueba: una Lambda mínima
+
+### 3.1 Configurar el CLI
 
 Crea un perfil `localstack` con claves falsas y el endpoint:
 ```bash
@@ -113,13 +115,101 @@ unset AWS_PROFILE
 ```
 (o `export AWS_PROFILE=<tu-perfil-real>`). En PowerShell: `$env:AWS_PROFILE = 'localstack'` y `Remove-Item Env:AWS_PROFILE`.
 
-Variables que usará el resto de la guía:
+### 3.2 Variables que usará el resto de la guía
 ```bash
 export AWS_REGION=us-east-2
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 echo "$ACCOUNT_ID"          # 000000000000 en LocalStack
 ```
 > En zsh, escribe siempre `${ACCOUNT_ID}` con llaves dentro de ARNs: `$ACCOUNT_ID:role` se interpreta como un modificador y rompe el texto.
+
+### 3.3 Primera prueba: una Lambda mínima de punta a punta
+Antes de construir el sistema, comprueba que tu entorno funciona con lo más pequeño posible: una Lambda `hello` que solo imprime lo que recibe. Si esto funciona, el resto de la guía también. **Esta secuencia se probó contra LocalStack 3.8.1** y terminó sin errores.
+
+**1. El código y el zip.**
+```bash
+mkdir hello-lambda && cd hello-lambda
+cat > index.js <<'EOF'
+exports.handler = async (event) => {
+  console.log("Evento recibido:", JSON.stringify(event));
+  return { ok: true, recibido: event };
+};
+EOF
+zip hello.zip index.js
+```
+(En Windows, sin `zip`: `tar -a -c -f hello.zip index.js`.)
+
+**2. Crear la función** (el rol es solo un ARN con la forma correcta: LocalStack no lo valida) **y esperar a que esté lista:**
+```bash
+aws lambda create-function --function-name hello \
+  --runtime nodejs20.x --handler index.handler \
+  --role "arn:aws:iam::${ACCOUNT_ID}:role/lambda-role" \
+  --zip-file fileb://hello.zip
+
+aws lambda wait function-active-v2 --function-name hello
+aws lambda get-function --function-name hello --query 'Configuration.[State,LastUpdateStatus]' --output text
+```
+La salida de `create-function` dice `State: Pending`, y la última línea debe decir `Active  Successful`.
+
+**3. Invocarla a mano.**
+```bash
+aws lambda invoke --function-name hello \
+  --cli-binary-format raw-in-base64-out --payload '{"nombre":"mundo"}' \
+  --log-type Tail --query LogResult --output text out.json | base64 --decode
+cat out.json
+```
+Resultado esperado:
+```
+START RequestId: … Version: $LATEST
+… INFO  Evento recibido: {"nombre":"mundo"}
+END RequestId: …
+REPORT RequestId: … Duration: 25.68 ms  Billed Duration: 26 ms  Memory Size: 128 MB …
+{"ok":true,"recibido":{"nombre":"mundo"}}
+```
+Las cuatro primeras líneas son el log de la ejecución; la última, lo que devolvió la función (`out.json`). La primera invocación puede tardar más, porque LocalStack descarga la imagen de Lambda.
+
+**4. Conectarla a una cola (un trigger).** Crea una cola, enlázala a la función y envía un mensaje con una marca única, para poder reconocerlo:
+```bash
+Q_URL=$(aws sqs create-queue --queue-name hello-queue --query QueueUrl --output text)
+Q_ARN=$(aws sqs get-queue-attributes --queue-url "$Q_URL" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+
+aws lambda create-event-source-mapping --function-name hello --event-source-arn "$Q_ARN" --batch-size 1
+aws lambda list-event-source-mappings --function-name hello --query 'EventSourceMappings[].State' --output text   # Enabled
+
+MARK="marca-$(date +%s)"
+aws sqs send-message --queue-url "$Q_URL" --message-body "{\"hola\":\"$MARK\"}"
+```
+
+**5. Comprobar que la Lambda procesó ese mensaje.** Espera unos 10 segundos y busca la marca en el log:
+```bash
+sleep 10
+aws logs filter-log-events --log-group-name /aws/lambda/hello --query 'events[].message' --output text | tr '\t' '\n' | grep "$MARK"
+```
+`--output text` junta todos los mensajes del log en **una sola línea separada por tabuladores**; `tr '\t' '\n'` los separa uno por línea, para que `grep` muestre solo el evento que contiene tu marca y no todo el historial. Debe salir algo así:
+```
+… INFO  Evento recibido: {"Records":[{"messageId":"…","body":"{\"hola\": \"marca-1791891606\"}","attributes":{…},"eventSource":"aws:sqs",…}]}
+```
+Si aparece esa línea con tu marca, el trigger funciona: SQS invocó la Lambda por sí solo (en la prueba tardó 1 segundo). Fíjate en `"eventSource":"aws:sqs"`: así es el evento real que reciben las Lambdas conectadas a una cola, igual al que fabricas a mano en la parte 7.1. Si no sale nada, espera otros 10 segundos y repite. La cola debe quedar vacía:
+```bash
+aws sqs get-queue-attributes --queue-url "$Q_URL" \
+  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+  --query 'Attributes.[ApproximateNumberOfMessages,ApproximateNumberOfMessagesNotVisible]' --output text   # 0   0
+```
+> **Busca la marca con `grep`, no con `--filter-pattern`:** LocalStack no aplica ese filtro de forma fiable y devuelve **todos** los eventos del grupo. Con él, una verificación puede dar "éxito" mostrando logs de una ejecución anterior sin que tu mensaje haya llegado: por eso se busca una marca única en el texto.
+
+**6. Limpiar** (en este orden: primero el mapeo):
+```bash
+UUID=$(aws lambda list-event-source-mappings --function-name hello --query 'EventSourceMappings[0].UUID' --output text)
+aws lambda delete-event-source-mapping --uuid "$UUID"
+aws lambda delete-function --function-name hello
+aws sqs delete-queue --queue-url "$Q_URL"
+aws logs delete-log-group --log-group-name /aws/lambda/hello
+cd .. && rm -rf hello-lambda
+```
+
+**Qué demuestra cada paso:** el 2 prueba que el CLI llega a LocalStack y que Docker ejecuta Lambdas; el 3, que puedes invocar una función y ver sus logs; el 4 y el 5, que un mensaje en una cola dispara la función sin que escribas código de lectura. Es exactamente el mecanismo que usa el proyecto.
+
+**En AWS real** es la misma secuencia, con tu perfil real y dos cambios: el rol de la Lambda debe existir (parte 9.1) y el runtime sería `nodejs22.x`. Cuidado: tendrías que crear la cola en tu cuenta real.
 
 ---
 
@@ -343,6 +433,7 @@ Si `tail` no funciona en tu versión de LocalStack:
 ```bash
 aws logs filter-log-events --log-group-name /aws/lambda/report-generator --query 'events[].message' --output text
 ```
+> **No uses `--filter-pattern` en LocalStack:** no se aplica de forma fiable y devuelve todos los eventos, incluidos los de ejecuciones anteriores. Para encontrar una ejecución concreta, filtra con `grep` por un dato único (el `requestId` del mensaje).
 Y verifica en la base que el recorder guardó la fila:
 ```bash
 psql reports_local -P pager=off -c "SELECT id, requester, type, requested_at FROM report_requests ORDER BY requested_at DESC LIMIT 3;"
