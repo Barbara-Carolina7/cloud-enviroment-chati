@@ -9,7 +9,7 @@ Para validar la credencial de Supabase (en cualquier sistema): `npm run db:check
 | Repo | Secrets | Variables |
 |---|---|---|
 | `cloud-chati-bff` | `GH_CR_PAT`, `EC2_SSH_KEY`, `API_GATEWAY_SECRET`, `SUPABASE_DB_USER`, `SUPABASE_DB_PASSWORD` | `TARGET_HOST_IP` |
-| `cloud-lambda-pg` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `LAMBDA_RECORDER_FUNCTION_NAME`, `LAMBDA_GENERATOR_FUNCTION_NAME` | — |
+| `cloud-lambda-pg` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `LAMBDA_RECORDER_FUNCTION_NAME`, `LAMBDA_GENERATOR_FUNCTION_NAME`, `API_NOTIFICATION`, `API_TOKEN_INTEGRATION`, `DATABASE_URL` | — |
 | `cloud-s3-chati` (front) | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `S3_BUCKET_NAME`, `CLOUDFRONT_DISTRIBUTION_ID` | — |
 
 Valores no secretos que te faltan en `cloud-lambda-pg` (los nombres cambiaron):
@@ -51,12 +51,28 @@ Secrets del repo: ver tabla arriba. **Cuidado con `DATABASE_URL` como secret de 
 
 ## Lambda `report-generator`
 
+Consume la cola `report-generation`, lee los 10 productos más caros de Supabase y publica un aviso en la API de notificaciones. Rol `report-generator-role`.
+
+| Variable (config de la Lambda) | Origen | Descripción |
+|---|---|---|
+| `API_NOTIFICATION` | secret `API_NOTIFICATION` | URL del sitio de la app (ej. `https://TU-APP/`). El código agrega `/api` y publica en `POST {URL}/api/saas/notices`; si la URL ya termina en `/api`, no lo duplica. Con o sin `/` final. |
+| `API_TOKEN_INTEGRATION` | secret `API_TOKEN_INTEGRATION` | API key (`crr_…`) enviada como `Authorization: ApiKey …`. **Secreto**: nunca en código, logs ni chat. |
+| `DATABASE_URL` | secret `DATABASE_URL` | Connection string de Supabase (la misma del recorder), para leer `products`. |
+| `DATABASE_SSL` | opcional | `false` solo para un Postgres local sin SSL. |
+| `NOTIFY_MODE` | solo local | `log` imprime el aviso en el log en vez de publicarlo. **No definir en AWS.** |
+
+El workflow copia los tres secrets a la Lambda tras desplegar el código. `update-function-configuration` **reemplaza todas** las variables, así que las tres se envían juntas; si falta alguna, el paso se salta con un aviso (`::warning::`) y la Lambda conserva su configuración anterior. Sin esas variables, la Lambda falla a propósito y el mensaje termina en la DLQ.
+
+## `.env` de la raíz (solo tu máquina, ignorado por git)
+
+Lo leen los scripts de `scripts/` (`config.js` carga `local/.env` y después `.env`; las variables ya definidas en el entorno tienen prioridad).
+
 | Variable | Descripción |
 |---|---|
-| — | Hoy no necesita ninguna. |
-| `EMAIL_FROM` *(futuro)* | Remitente verificado en SES cuando se reemplace el `console.log` por email. Requerirá `ses:SendEmail` en `report-generator-role`. |
+| `API_NOTIFICATION` | URL del sitio de la app (ej. `https://TU-APP/`). Los scripts publican en `POST {URL}/api/saas/notices`. |
+| `API_TOKEN_INTEGRATION` | API key `crr_…`. Secreto. |
 
-Consume la cola `report-generation`. Rol `report-generator-role`.
+Para probarlas sin pasar por AWS: `npm run notify:test` (ver más abajo en `GUIA.md`, sección 6).
 
 ## Front (S3 + CloudFront)
 

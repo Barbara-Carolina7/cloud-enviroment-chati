@@ -1,17 +1,21 @@
-// Configuración compartida por todos los scripts. Carga local/.env si existe
-// (las variables ya definidas en el entorno tienen prioridad sobre el archivo).
+// Configuración compartida por todos los scripts. Carga, en este orden de prioridad:
+//   1. variables ya definidas en el entorno
+//   2. local/.env   (stack local: base de datos, usuario OIDC falso)
+//   3. .env en la raíz del proyecto (credenciales de integración, p. ej. la API de avisos)
+// Ambos archivos están ignorados por git.
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 
-const envFile = path.join(ROOT, 'local', '.env')
-if (existsSync(envFile)) {
+for (const rel of [path.join('local', '.env'), '.env']) {
+  const envFile = path.join(ROOT, rel)
+  if (!existsSync(envFile)) continue
   try {
-    process.loadEnvFile(envFile)
+    process.loadEnvFile(envFile) // no pisa variables que ya existan
   } catch (err) {
-    console.warn(`AVISO: no se pudo leer local/.env (${err.code ?? err.message}); se usan solo las variables del entorno.`)
+    console.warn(`AVISO: no se pudo leer ${rel} (${err.code ?? err.message}); se usan solo las variables del entorno.`)
   }
 }
 

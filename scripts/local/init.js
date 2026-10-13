@@ -70,7 +70,7 @@ const generationArn = await createQueueWithDlq('report-generation')
 
 console.log('== Empaquetando Lambdas')
 const recorderZip = await buildLambdaZip(paths.recorder, { install: true })
-const generatorZip = await buildLambdaZip(paths.generator, { install: false })
+const generatorZip = await buildLambdaZip(paths.generator, { install: true })
 
 async function deployLambda({ name, zip, queueArn: sourceArn, env }) {
   // LocalStack no borra los mapeos al borrar la función: se eliminan primero.
@@ -106,7 +106,22 @@ await deployLambda({
   queueArn: requestsArn,
   env: { DATABASE_URL: db.lambdaUrl, DATABASE_SSL: String(db.ssl) },
 })
-await deployLambda({ name: 'report-generator', zip: generatorZip, queueArn: generationArn })
+// Por defecto el aviso se imprime en el log (NOTIFY_MODE=log). Para publicarlo de verdad en la API de avisos,
+// define API_NOTIFICATION y API_TOKEN_INTEGRATION en local/.env.
+const publishForReal = process.env.API_NOTIFICATION && process.env.API_TOKEN_INTEGRATION
+await deployLambda({
+  name: 'report-generator',
+  zip: generatorZip,
+  queueArn: generationArn,
+  env: {
+    DATABASE_URL: db.lambdaUrl,
+    DATABASE_SSL: String(db.ssl),
+    ...(publishForReal
+      ? { API_NOTIFICATION: process.env.API_NOTIFICATION, API_TOKEN_INTEGRATION: process.env.API_TOKEN_INTEGRATION }
+      : { NOTIFY_MODE: 'log' }),
+  },
+})
+console.log(publishForReal ? 'report-generator publicará avisos en la API real.' : 'report-generator imprimirá el aviso en su log (NOTIFY_MODE=log).')
 
 console.log(`\nListo (${REGION}, cuenta ${ACCOUNT_ID}). Base: ${db.label}`)
 console.log('Siguiente: npm run local:send-test   (prueba sin BFF)   |   npm run local:dev   (OIDC + BFF + front)')

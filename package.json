@@ -15,7 +15,8 @@
     "local:send-test": "node scripts/local/send-test.js",
     "local:down": "node scripts/local/down.js",
     "db:schema": "node scripts/local/db-schema.js",
-    "db:check": "node scripts/db-check.js"
+    "db:check": "node scripts/db-check.js",
+    "notify:test": "node scripts/notify-test.js"
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch-logs": "^3.1150.0",

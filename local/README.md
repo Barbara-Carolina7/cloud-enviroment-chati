@@ -5,7 +5,7 @@ Emula SNS, SQS y Lambda con LocalStack; la base de datos es la que indiques en `
 
 ```
 BFF local ──► SNS report-events ─┬─► SQS report-requests ──► report-request-recorder ──► tu Postgres
-                                 └─► SQS report-generation ─► report-generator (console.log)
+                                 └─► SQS report-generation ─► report-generator (trae el top 10 de products y arma el aviso)
 ```
 
 ## Requisitos
@@ -61,6 +61,16 @@ En `local/.env`: la URL de Supabase y quita `DATABASE_SSL=false` (Supabase exige
 - **Autenticación:** el OIDC falso emite tokens RS256 con `email` y `cognito:groups`. El BFF los valida de verdad (firma, issuer, rol); solo cambia a quién le pregunta, con `SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI`. Escucha en `127.0.0.1` porque un BFF con `-Djava.net.preferIPv4Stack=true` no alcanza un servidor enlazado solo a `::1`.
 - **Front:** `npm run dev` usa `front/.env.development.local` (lo crea `local:dev` si falta; solo aplica a `vite` en desarrollo, nunca al build de producción). Un proxy de Vite reenvía `/api` al BFF con el header `X-Secret-Gateway`, porque el BFF no tiene CORS propio.
 - **Lambda → base local:** `localhost` se reescribe a `host.docker.internal` para que la Lambda, que corre en un contenedor, alcance tu base.
+
+## El aviso del informe en local
+`report-generator` lee los 10 productos más caros de la tabla `products` de tu base y arma un aviso. En local, por defecto **solo lo imprime** en su log (`NOTIFY_MODE=log`), sin llamar a ninguna API. Para verlo, crea antes algún producto en tu base local (el BFF crea la tabla `products` al arrancar) y ejecuta `npm run local:send-test`.
+
+Para publicarlo de verdad en la API de avisos, define en `local/.env` estas dos variables y repite `npm run local:init`:
+```
+API_NOTIFICATION=https://tu-api.example.com/
+API_TOKEN_INTEGRATION=crr_...
+```
+El token es un secreto: `local/.env` está ignorado por git, y nunca debe subirse.
 
 ## Notas
 - La primera invocación de una Lambda descarga la imagen de runtime; puede tardar ~1 minuto.

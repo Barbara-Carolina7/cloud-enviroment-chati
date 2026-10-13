@@ -22,13 +22,15 @@ API Gateway (HTTP API) ──► BFF (Spring Boot en EC2)
                 SQS report-requests (+DLQ)       SQS report-generation (+DLQ)
                           ▼                                ▼
             Lambda report-request-recorder       Lambda report-generator
-            guarda en report_requests            arma el informe → console.log
-                          ▼                      (email con SES: pendiente)
-                  Supabase Postgres
+            guarda en report_requests            lee los 10 productos más caros
+                          ▼                      y publica un aviso en la API de avisos
+                  Supabase Postgres  ◄───────────────────┘ (lee products)
 ```
 
 Decisiones de diseño:
 - **Dos colas independientes** desde un SNS maestro: guardar la solicitud y generar el informe no dependen entre sí.
+- **La API cuelga de `/api`:** el endpoint es `POST /api/saas/notices`. `API_NOTIFICATION` es la URL del sitio (`https://TU-APP/`) y el código agrega `/api`; si ya termina en `/api`, no lo duplica. Sin ese prefijo, el nginx del sitio responde `405 Not Allowed` con una página HTML (así falló la primera vez). La Lambda detecta esas respuestas y falla con un mensaje claro; `npm run notify:test` también las diagnostica.
+- **El informe es un aviso:** `report-generator` consulta los 10 productos más caros en Supabase y los publica con `POST {API_NOTIFICATION}/saas/notices` (`Authorization: ApiKey <token>`, cuerpo `{"text": "…"}`, de 1 a 2000 caracteres).
 - **Filtro sobre el cuerpo del mensaje** (`FilterPolicyScope=MessageBody`), no sobre atributos: el `type` va dentro del JSON.
 - **DLQ con 3 reintentos** en cada cola.
 - **Un rol por Lambda** con permisos mínimos (logs + su cola).
@@ -132,8 +134,8 @@ sleep 12   # propagación de IAM
 ```bash
 # recorder (necesita la dependencia pg)
 cd lambdas/pg/report-request-recorder && npm ci --omit=dev && zip -r ../recorder.zip . && cd ../../..
-# generator (sin dependencias)
-cd lambdas/pg/report-generator && zip -r ../generator.zip . && cd ../../..
+# generator (también necesita pg)
+cd lambdas/pg/report-generator && npm ci --omit=dev && zip -r ../generator.zip . && cd ../../..
 
 # La connection string va en un archivo (contiene comas y símbolos que rompen la sintaxis corta)
 echo '{"Variables":{"DATABASE_URL":"postgresql://USUARIO:CLAVE@HOST:5432/postgres"}}' > env-recorder.json
@@ -143,17 +145,19 @@ aws lambda create-function --function-name report-request-recorder --runtime nod
   --role "arn:aws:iam::${ACCOUNT_ID}:role/report-request-recorder-role" \
   --zip-file fileb://lambdas/pg/recorder.zip --environment file://env-recorder.json
 
+# generator: ahora también necesita pg y tres variables de entorno
+echo '{"Variables":{"API_NOTIFICATION":"https://TU-API/","API_TOKEN_INTEGRATION":"crr_...","DATABASE_URL":"postgresql://USUARIO:CLAVE@HOST:5432/postgres"}}' > env-generator.json
 aws lambda create-function --function-name report-generator --runtime nodejs22.x \
   --handler index.handler --timeout 15 --memory-size 128 \
   --role "arn:aws:iam::${ACCOUNT_ID}:role/report-generator-role" \
-  --zip-file fileb://lambdas/pg/generator.zip
+  --zip-file fileb://lambdas/pg/generator.zip --environment file://env-generator.json
 
 # Triggers SQS → Lambda
 aws lambda create-event-source-mapping --function-name report-request-recorder --batch-size 5 \
   --event-source-arn "arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:report-requests"
 aws lambda create-event-source-mapping --function-name report-generator --batch-size 5 \
   --event-source-arn "arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:report-generation"
-rm env-recorder.json   # no dejes la connection string en disco
+rm env-recorder.json env-generator.json   # no dejes secretos en disco
 ```
 
 ### 2.6 Permiso del BFF para publicar
@@ -213,7 +217,11 @@ lambdas/pg/
 └── .github/workflows/         deploy-report-request-recorder.yml, deploy-report-generator.yml
 ```
 - **recorder:** por cada registro SQS, desenvuelve el sobre SNS, exige `type === "report.requested"` y ejecuta `INSERT … ON CONFLICT (id) DO NOTHING` con `$5::jsonb` (idempotente: SQS entrega "al menos una vez"). Conexión con `ssl: {rejectUnauthorized:false}` salvo `DATABASE_SSL=false`.
-- **generator:** valida la solicitud, arma el informe (tipo, solicitante, parámetros, fecha) y lo entrega vía `notifier.sendReport`, hoy un `console.log`. Para email: reemplazar el cuerpo de `src/notifier.js` por SES (`@aws-sdk/client-ses`) y dar `ses:SendEmail` a `report-generator-role`.
+- **generator:** capas `handler → report.service → product.repository / notifier`.
+  - `product.repository.js`: `SELECT id, name, price, stock FROM products WHERE price IS NOT NULL ORDER BY price DESC LIMIT 10` (dependencia `pg`).
+  - `report.service.js`: valida la solicitud y arma el texto: un encabezado con el tipo y el solicitante, y una línea por producto (`1. Nombre - $precio (stock N)`), recortado a 2000 caracteres.
+  - `notifier.js`: `POST {API_NOTIFICATION}/api/saas/notices` con `Authorization: ApiKey {API_TOKEN_INTEGRATION}`, con `redirect: "manual"` (un redirect convertiría el POST en GET). Solo un **2xx con JSON** cuenta como entregado; una redirección, una página HTML, un código distinto de 2xx o variables faltantes **lanzan error**: el mensaje se reintenta y, tras 3 intentos, queda en la DLQ en vez de perderse. Con `NOTIFY_MODE=log` (solo desarrollo local) imprime el aviso sin publicarlo. El token nunca se escribe en los logs.
+  - Variables de entorno de la Lambda: `API_NOTIFICATION`, `API_TOKEN_INTEGRATION`, `DATABASE_URL`.
 - Ambas lanzan error ante cualquier fallo: SQS reintenta y, tras 3 intentos, manda a la DLQ.
 
 ### 3.3 Front (`cloud-s3-chati`, React + Vite + `react-oidc-context`)
@@ -233,10 +241,10 @@ lambdas/pg/
 | Repo | Secrets / variables |
 |---|---|
 | BFF | `GH_CR_PAT`, `EC2_SSH_KEY`, `API_GATEWAY_SECRET`, `SUPABASE_DB_USER`, `SUPABASE_DB_PASSWORD`; variable `TARGET_HOST_IP` (la IP **vigente** de la EC2) |
-| Lambdas | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION=us-east-2`, `LAMBDA_RECORDER_FUNCTION_NAME=report-request-recorder`, `LAMBDA_GENERATOR_FUNCTION_NAME=report-generator` |
+| Lambdas | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION=us-east-2`, `LAMBDA_RECORDER_FUNCTION_NAME=report-request-recorder`, `LAMBDA_GENERATOR_FUNCTION_NAME=report-generator`, **`API_NOTIFICATION`** (URL base de la API de avisos), **`API_TOKEN_INTEGRATION`** (API key `crr_…`), **`DATABASE_URL`** (la de Supabase) |
 | Front | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `S3_BUCKET_NAME`, `CLOUDFRONT_DISTRIBUTION_ID` |
 
-No definas `DATABASE_URL` como secret del repo de Lambdas: su workflow reemplazaría **todas** las variables de la función con esa sola.
+Los secrets de GitHub solo existen dentro del workflow: el de `report-generator` los copia a las variables de entorno de la Lambda con `update-function-configuration`, que **reemplaza todas** las variables, por eso envía las tres juntas. Si falta alguna, ese paso se salta con un aviso y la Lambda conserva su configuración anterior. El workflow de `report-request-recorder` también reemplazaría las suyas si defines `DATABASE_URL`; como ahora sí lo defines para el generator, ese paso se activa y deja solo `DATABASE_URL` (para Supabase basta: el SSL va activo por defecto).
 
 ### 4.2 Orden
 1. Infraestructura AWS (parte 2).
@@ -316,9 +324,20 @@ psql reports_local -P pager=off -c "SELECT id, requester, type, requested_at FRO
 | ARN con `ole/…` roto | `$ACC:role` en zsh es un modificador | Usar `${ACC}` con llaves |
 | `git commit` falla firmando | Firma GPG activa y no accesible desde un entorno restringido | Hacer el commit desde tu terminal |
 | `gh secret` da 403 | `gh` está autenticado con otra cuenta | `gh auth login --hostname github.com --git-protocol https --web` con la cuenta dueña del repo, o crear los secrets desde la web |
+| El aviso no llega y el log del generador dice `HTTP 405 … nginx` con una página HTML | La petición iba a `/saas/notices` en vez de `/api/saas/notices` (el nginx del sitio no acepta el POST) | Era un error de ruta: la API es `/api/saas/notices`. Con el código actual, `API_NOTIFICATION` basta con la URL del sitio. Se prueba con `npm run notify:test` |
 | La Lambda no alcanza tu Postgres local | Dentro del contenedor `localhost` es el propio contenedor | Usar `host.docker.internal` |
 
 ---
+
+### Probar la API de avisos sin pasar por AWS
+Con `API_NOTIFICATION` y `API_TOKEN_INTEGRATION` en el `.env` de la raíz:
+```bash
+npm run notify:test                                  # envía un aviso de prueba
+npm run notify:test -- "Texto del aviso"
+npm run notify:test -- --base https://api.ejemplo.com   # prueba otra URL base sin editar el .env
+npm run notify:test -- --dry-run                     # muestra qué enviaría, sin enviarlo
+```
+Imprime el estado HTTP y un diagnóstico: página HTML (la URL es un sitio web), 401/403 (clave inválida), 404 (falta un prefijo como `/api`), redirección (usar el destino como base). Nunca muestra el token.
 
 ## 7. Lista de verificación final
 - [ ] `aws sns list-subscriptions-by-topic` muestra las dos colas con filtro `report.requested` sobre `MessageBody`.
@@ -336,4 +355,4 @@ psql reports_local -P pager=off -c "SELECT id, requester, type, requested_at FRO
 - API Gateway → EC2 va por HTTP plano a una IP sin Elastic IP: usar una IP fija o un ALB con HTTPS.
 - SSH (22) abierto a Internet: restringir a tu IP o usar SSM Session Manager.
 - Verificar que `TARGET_HOST_IP` del BFF apunte a la IP actual de la EC2.
-- Email real del informe con SES.
+- El aviso se publica una vez por mensaje; como SQS entrega "al menos una vez", un reintento puede publicar un aviso duplicado. Si la API de avisos lo permite, conviene una clave de idempotencia con el `requestId`.
