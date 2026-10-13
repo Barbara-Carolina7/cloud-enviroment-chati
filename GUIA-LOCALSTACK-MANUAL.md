@@ -33,6 +33,8 @@ SNS report-events ─┬─► SQS report-requests   (+DLQ) ──► Lambda rep
 
 ## Mac, Linux y Windows: cómo leer esta guía
 
+**Trabaja en una carpeta vacía, fuera de cualquier repositorio** (por ejemplo `mkdir ~/localstack-guia && cd ~/localstack-guia`). La guía crea archivos de apoyo (zips, JSON, y en 6.9 un archivo con tu API key), y un `git add -A` descuidado podría subirlos.
+
 **Qué terminal usar en cada sistema**
 
 | Sistema | Opción | Qué versión de los comandos |
@@ -509,7 +511,7 @@ aws sqs purge-queue --queue-url $GENERATION_URL
 
 ## 6. Lambdas y sus triggers
 
-Para no depender de ningún repositorio, esta parte usa **dos Lambdas de ejemplo que solo imprimen en consola** lo que reciben. Se llaman como las reales (`report-request-recorder` y `report-generator`) para que el resto de la guía funcione igual, y ambas ejecutan el mismo código de unas pocas líneas. Al final (6.8) se explica cómo cambiarlas por el código real del proyecto.
+Para no depender de ningún repositorio, esta parte usa **dos Lambdas de ejemplo que solo imprimen en consola** lo que reciben. Se llaman como las reales (`report-request-recorder` y `report-generator`) para que el resto de la guía funcione igual, y ambas ejecutan el mismo código de unas pocas líneas. Al final (6.8) se explica cómo cambiarlas por el código real del proyecto, y en 6.9 cómo hacer que una de ellas **publique cada mensaje como un aviso en tu API** para validar el recorrido completo.
 
 ### 6.1 El código y el zip
 Una Lambda de Node se sube como un `.zip` con su código. Este ejemplo tiene un solo archivo, sin dependencias, así que no hace falta `npm`:
@@ -710,29 +712,218 @@ EOF
 ```
 Reemplaza `USUARIO` por tu usuario de Postgres local. Si tu Postgres tiene contraseña: `postgresql://USUARIO:CLAVE@…`.
 
-**3. Reemplazar el código y las variables:**
+**3. Reemplazar el código y las variables.** El `--query LastUpdateStatus --output text` del final no es adorno: sin él, la respuesta de `update-function-configuration` **imprime todas las variables de entorno**, incluida la contraseña de la base:
 
 **bash**
 ```bash
 aws lambda update-function-code --function-name report-request-recorder --zip-file fileb://lambdas/pg/recorder.zip
 aws lambda wait function-updated --function-name report-request-recorder
-aws lambda update-function-configuration --function-name report-request-recorder --environment file://env-recorder.json
+aws lambda update-function-configuration --function-name report-request-recorder --environment file://env-recorder.json --query LastUpdateStatus --output text
 
 aws lambda update-function-code --function-name report-generator --zip-file fileb://lambdas/pg/generator.zip
 aws lambda wait function-updated --function-name report-generator
-aws lambda update-function-configuration --function-name report-generator --environment file://env-generator.json
+aws lambda update-function-configuration --function-name report-generator --environment file://env-generator.json --query LastUpdateStatus --output text
 ```
 **PowerShell**
 ```powershell
 aws lambda update-function-code --function-name report-request-recorder --zip-file fileb://lambdas/pg/recorder.zip
 aws lambda wait function-updated --function-name report-request-recorder
-aws lambda update-function-configuration --function-name report-request-recorder --environment file://env-recorder.json
+aws lambda update-function-configuration --function-name report-request-recorder --environment file://env-recorder.json --query LastUpdateStatus --output text
 
 aws lambda update-function-code --function-name report-generator --zip-file fileb://lambdas/pg/generator.zip
 aws lambda wait function-updated --function-name report-generator
-aws lambda update-function-configuration --function-name report-generator --environment file://env-generator.json
+aws lambda update-function-configuration --function-name report-generator --environment file://env-generator.json --query LastUpdateStatus --output text
 ```
 Con el código real, el recorder necesita la tabla `report_requests` (SQL en `GUIA.md`, parte 1) y que Postgres acepte conexiones desde Docker; el generador, la tabla `products`. En AWS real las variables cambian (parte 9).
+
+### 6.9 Prueba de punta a punta: SNS → Lambda → `/notices` (con tu API key)
+Hasta aquí las Lambdas solo imprimen. En este paso `report-generator` **publica cada mensaje que recibe como un aviso en tu app**, con `POST /api/saas/notices` y tu API key, y compruebas todo el recorrido: SNS → cola → Lambda → API → pantalla de avisos. La otra Lambda (`report-request-recorder`) sigue imprimiendo, para ver que el mismo mensaje llega a las dos.
+
+Necesitas la **URL del sitio de tu app** (la API cuelga de `/api`, que el código agrega solo) y una **API key** (se genera en tu perfil de la app; empieza con `crr_`). La API key es un **secreto**: no la pegues en ningún archivo de un repositorio ni en un chat, y nunca la escribas directamente en un comando (quedaría en tu historial). Los pasos la piden sin mostrarla y no la guardan en ningún sitio salvo en la configuración de la función.
+
+> **Esto crea un aviso real en tu app.** El texto de la prueba es un JSON con la marca `e2e-…` y `PRUEBA_E2E`, fácil de reconocer. La API de avisos no se emula: se llama de verdad, y la Lambda (que corre en un contenedor de Docker) necesita salida a Internet.
+
+**1. Tus datos**, sin que la clave se vea ni quede en el historial:
+
+**bash** (funciona en bash y en zsh)
+```bash
+export API_NOTIFICATION="https://TU-APP/"
+printf 'API key (no se muestra): '; stty -echo; read -r API_TOKEN_INTEGRATION; stty echo; echo
+export API_TOKEN_INTEGRATION
+```
+**PowerShell**
+```powershell
+$env:API_NOTIFICATION = "https://TU-APP/"
+$clave = Read-Host "API key (no se muestra)" -AsSecureString
+$env:API_TOKEN_INTEGRATION = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($clave))
+```
+
+**2. El código del notificador.** Otra Lambda de ejemplo, también sin dependencias (usa el `fetch` que trae Node 20). Recibe cada mensaje de SQS, lo desenvuelve igual que la anterior y lo publica como aviso:
+
+**bash**
+```bash
+mkdir lambda-notifier
+cat > lambda-notifier/index.js <<'EOF'
+// Lambda de ejemplo: publica cada mensaje recibido de SQS como un aviso en la API (POST /api/saas/notices).
+function leer(texto) {
+  try { return JSON.parse(texto); } catch { return texto; }
+}
+
+exports.handler = async (event) => {
+  const base = (process.env.API_NOTIFICATION || "").trim().replace(/\/+$/, "");
+  const token = process.env.API_TOKEN_INTEGRATION;
+  if (!base || !token) throw new Error("Faltan API_NOTIFICATION y/o API_TOKEN_INTEGRATION");
+  // La API cuelga de /api: se agrega si no viene ya en la URL
+  const url = base + (/\/api$/i.test(base) ? "" : "/api") + "/saas/notices";
+
+  for (const registro of event.Records || []) {
+    const externo = leer(registro.body);
+    const mensaje = externo && externo.Message ? leer(externo.Message) : externo;
+    const texto = (typeof mensaje === "string" ? mensaje : JSON.stringify(mensaje)).slice(0, 2000);
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: "ApiKey " + token, "Content-Type": "application/json" },
+      body: JSON.stringify({ text: texto }),
+      redirect: "manual", // un redirect convertiría el POST en GET y el aviso no se crearía
+    });
+    // Un error lanza una excepción: el mensaje vuelve a la cola y, tras 3 intentos, va a la DLQ.
+    if (!res.ok) throw new Error("La API respondió HTTP " + res.status);
+    console.log("Aviso publicado (HTTP " + res.status + "):", texto.slice(0, 120));
+  }
+};
+EOF
+(cd lambda-notifier && zip ../notifier.zip index.js)
+```
+**PowerShell**
+```powershell
+mkdir lambda-notifier
+@'
+// Lambda de ejemplo: publica cada mensaje recibido de SQS como un aviso en la API (POST /api/saas/notices).
+function leer(texto) {
+  try { return JSON.parse(texto); } catch { return texto; }
+}
+
+exports.handler = async (event) => {
+  const base = (process.env.API_NOTIFICATION || "").trim().replace(/\/+$/, "");
+  const token = process.env.API_TOKEN_INTEGRATION;
+  if (!base || !token) throw new Error("Faltan API_NOTIFICATION y/o API_TOKEN_INTEGRATION");
+  // La API cuelga de /api: se agrega si no viene ya en la URL
+  const url = base + (/\/api$/i.test(base) ? "" : "/api") + "/saas/notices";
+
+  for (const registro of event.Records || []) {
+    const externo = leer(registro.body);
+    const mensaje = externo && externo.Message ? leer(externo.Message) : externo;
+    const texto = (typeof mensaje === "string" ? mensaje : JSON.stringify(mensaje)).slice(0, 2000);
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: "ApiKey " + token, "Content-Type": "application/json" },
+      body: JSON.stringify({ text: texto }),
+      redirect: "manual", // un redirect convertiría el POST en GET y el aviso no se crearía
+    });
+    // Un error lanza una excepción: el mensaje vuelve a la cola y, tras 3 intentos, va a la DLQ.
+    if (!res.ok) throw new Error("La API respondió HTTP " + res.status);
+    console.log("Aviso publicado (HTTP " + res.status + "):", texto.slice(0, 120));
+  }
+};
+'@ | Set-Content -Encoding ascii lambda-notifier/index.js
+Push-Location lambda-notifier; tar -a -c -f ../notifier.zip index.js; Pop-Location
+```
+La API exige que el texto tenga entre 1 y 2000 caracteres (por eso el `slice`). El token viaja solo en el encabezado `Authorization: ApiKey …` y **nunca se escribe en el log**.
+
+**3. Sustituir el código de `report-generator` y darle las variables.** Las variables van en un archivo que se borra enseguida. Fíjate en el `--query` final: sin él, la respuesta de `update-function-configuration` **imprimiría tu API key**:
+
+**bash**
+```bash
+printf '{"Variables":{"API_NOTIFICATION":"%s","API_TOKEN_INTEGRATION":"%s"}}' "$API_NOTIFICATION" "$API_TOKEN_INTEGRATION" > env-notifier.json
+
+aws lambda update-function-code --function-name report-generator --zip-file fileb://notifier.zip --query LastUpdateStatus --output text
+aws lambda wait function-updated --function-name report-generator
+aws lambda update-function-configuration --function-name report-generator --environment file://env-notifier.json --query LastUpdateStatus --output text
+aws lambda wait function-updated --function-name report-generator
+
+rm env-notifier.json
+```
+**PowerShell**
+```powershell
+@{ Variables = @{ API_NOTIFICATION = $env:API_NOTIFICATION; API_TOKEN_INTEGRATION = $env:API_TOKEN_INTEGRATION } } | ConvertTo-Json -Compress | Set-Content -Encoding ascii env-notifier.json
+
+aws lambda update-function-code --function-name report-generator --zip-file fileb://notifier.zip --query LastUpdateStatus --output text
+aws lambda wait function-updated --function-name report-generator
+aws lambda update-function-configuration --function-name report-generator --environment file://env-notifier.json --query LastUpdateStatus --output text
+aws lambda wait function-updated --function-name report-generator
+
+Remove-Item env-notifier.json
+```
+Cada `update-…` imprime `InProgress` o `Successful`; los `wait` esperan a que termine.
+
+**4. Enviar un mensaje al SNS**, con una marca única para reconocerlo:
+
+**bash**
+```bash
+MARK="e2e-$(date +%s)"
+aws sns publish --topic-arn "$TOPIC_ARN" \
+  --message "{\"type\":\"report.requested\",\"body\":{\"requestId\":\"$MARK\",\"requester\":\"guia@ejemplo.com\",\"reportType\":\"PRUEBA_E2E\"}}"
+echo "Busca este texto en /notices: $MARK"
+```
+**PowerShell**
+```powershell
+$MARK = "e2e-" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+@{ type = "report.requested"; body = @{ requestId = $MARK; requester = "guia@ejemplo.com"; reportType = "PRUEBA_E2E" } } | ConvertTo-Json -Compress | Set-Content -Encoding ascii msg-e2e.json
+aws sns publish --topic-arn $TOPIC_ARN --message file://msg-e2e.json
+"Busca este texto en /notices: $MARK"
+```
+
+**5. Comprobar el resultado**, en dos sitios.
+
+*En el log de la Lambda*: debe decir que publicó el aviso (HTTP 201 = creado):
+
+**bash**
+```bash
+sleep 10
+aws logs filter-log-events --log-group-name /aws/lambda/report-generator --query 'events[].message' --output text | tr '\t' '\n' | grep "Aviso publicado"
+```
+**PowerShell**
+```powershell
+Start-Sleep 10
+(aws logs filter-log-events --log-group-name /aws/lambda/report-generator --query 'events[].message' --output text) -split "`t" | Select-String "Aviso publicado"
+```
+Salida esperada:
+```
+… INFO  Aviso publicado (HTTP 201): {"type":"report.requested","body":{"requestId":"e2e-1791896500","requester":"guia@ejemplo.com","reportType":"PRUEBA_E2E"}}
+```
+*En tu app*: abre `https://TU-APP/notices`. Debe aparecer un aviso cuyo texto contiene la marca `e2e-…`. Esa es la validación completa: el mensaje que enviaste a SNS recorrió la cola y la Lambda, y terminó en tu pantalla de avisos.
+
+*Preguntándole a la API* (opcional, sin navegador): la misma API key permite listar tus avisos. Si la marca aparece, el aviso existe en la API:
+
+**bash**
+```bash
+curl -s -H "Authorization: ApiKey $API_TOKEN_INTEGRATION" "${API_NOTIFICATION%/}/api/saas/notices?mine=1&limit=20" | grep -o "$MARK"
+```
+**PowerShell**
+```powershell
+curl.exe -s -H "Authorization: ApiKey $env:API_TOKEN_INTEGRATION" "$($env:API_NOTIFICATION.TrimEnd('/'))/api/saas/notices?mine=1&limit=20" | Select-String $MARK
+```
+Imprime tu marca (`e2e-…`) si el aviso está. (Estos dos comandos suponen que `API_NOTIFICATION` es la URL del sitio, sin `/api`, como en el paso 1.)
+
+Mientras tanto, `report-request-recorder` imprimió el mismo mensaje en su log (compruébalo con el comando de 7.3), porque SNS lo copió a las dos colas.
+
+Esta secuencia se probó de punta a punta contra LocalStack 3.8.1 y una API de avisos real: el log mostró `Aviso publicado (HTTP 201)`, la API listó el aviso con la marca, y la clave no apareció en ningún log.
+
+**Si algo falla**, el log de la Lambda dice por qué (el mensaje vuelve a la cola, se reintenta 3 veces y luego va a la DLQ, parte 10):
+
+| El log dice | Causa | Solución |
+|---|---|---|
+| `Faltan API_NOTIFICATION y/o API_TOKEN_INTEGRATION` | Las variables no llegaron a la función | Repetir el paso 3 (y revisar que el paso 1 las dejó definidas) |
+| `La API respondió HTTP 401` o `403` | La API key no es válida, o no tiene permiso | Generar otra en tu perfil y repetir 1 y 3 |
+| `La API respondió HTTP 404`, `405` o `3xx` | La URL base no es la del sitio de la app | Probarla con el `notify:test` del proyecto, o revisar `API_NOTIFICATION` |
+| `fetch failed` / `ENOTFOUND` | El contenedor de la Lambda no sale a Internet, o el dominio no existe | Revisar la red de Docker y la URL |
+| No aparece nada en el log | La Lambda aún no corrió, o el trigger no existe | Esperar 10 s más; `list-event-source-mappings` (6.5) |
+
+**6. Limpiar.** El aviso de prueba se borra desde la pantalla de avisos de tu app. La función de LocalStack se elimina junto con el contenedor (`docker rm -f localstack`), o puedes devolverla a la versión que solo imprime subiendo `demo.zip` otra vez (6.6). Cierra la terminal o limpia las variables cuando termines: `unset API_TOKEN_INTEGRATION` (bash) o `Remove-Item Env:API_TOKEN_INTEGRATION` (PowerShell).
+
+**En AWS real** es la misma Lambda y las mismas variables; lo que cambia es el rol (parte 9.1) y que las variables se pasan en `create-function` (con el `--query`, para no imprimirlas). Para producción, guarda la API key en **AWS Secrets Manager** o **SSM Parameter Store** en vez de una variable de entorno de la función.
 
 ---
 
@@ -1252,7 +1443,7 @@ EOF
 {"Variables":{"API_NOTIFICATION":"https://TU-APP/","API_TOKEN_INTEGRATION":"crr_...","DATABASE_URL":"postgresql://USUARIO:CLAVE@HOST:5432/postgres"}}
 '@ | Set-Content -Encoding ascii env-generator.json
 ```
-Bórralo al terminar (`rm env-generator.json`, o `Remove-Item env-generator.json`): tiene secretos.
+Bórralo al terminar (`rm env-generator.json`, o `Remove-Item env-generator.json`): tiene secretos. Y ojo: `create-function` y `update-function-configuration` **imprimen las variables de entorno** (con el token y la contraseña) en su respuesta; agrega `--query FunctionArn --output text` (o `--query LastUpdateStatus --output text`) para que no se muestren.
 
 ### 9.3 El servidor en AWS real
 - El servidor corre en una EC2 con un **rol de instancia**. Ese rol necesita permiso para publicar en el topic:
@@ -1350,6 +1541,7 @@ aws sns delete-topic --topic-arn <TOPIC_ARN>
 | `ResourceConflictException` al crear un mapeo | Quedó un mapeo anterior | Borrarlo (parte 6.7) |
 | `InvalidParameterValueException: The role defined for the function cannot be assumed` (AWS real) | El rol no existe o aún no se propaga | Crear el rol (9.1) y esperar 10 segundos |
 | El mensaje no llega a una cola | El filtro no coincide, o falta la política de la cola | `receive-message` de la parte 5; revisa el `type` y el scope `MessageBody` |
+| El aviso no aparece en `/notices` y el log dice `La API respondió HTTP …` (6.9) | La API rechazó la publicación | Ver la tabla de 6.9, paso 5 |
 | (código real, 6.8) La Lambda falla con `ECONNREFUSED` al conectarse a Postgres (local) | Usa `localhost`, que dentro del contenedor es él mismo | `host.docker.internal` en `DATABASE_URL` |
 | (código real, 6.8) La Lambda falla con `no pg_hba.conf entry` o por SSL (local) | Postgres local no usa SSL | `DATABASE_SSL=false` |
 | (código real, 6.8) `relation "report_requests" does not exist` | La tabla aún no existe | Crearla con el SQL de `GUIA.md` (parte 1), o arrancar el BFF |
