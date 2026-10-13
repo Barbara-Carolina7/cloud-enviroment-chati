@@ -1,0 +1,6 @@
+{
+  "Variables": {
+    "DATABASE_URL": "postgresql://postgres:postgres123@host.docker.internal:5432/reports_local",
+    "DATABASE_SSL": "false"
+  }
+}
