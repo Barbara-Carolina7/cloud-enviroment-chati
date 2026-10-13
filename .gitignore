@@ -17,6 +17,7 @@
 .envrc
 secrets/
 secret*.json
+env-*.json
 *secret*
 *password*
 *credential*

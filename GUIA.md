@@ -156,7 +156,7 @@ Edita `local/.env` (ver [parte 6](#6-entorno-local-programar-sin-la-nube)). Ese 
 ---
 
 ## 3. Infraestructura en AWS (a mano)
-Los comandos son bash. En Windows, usa Git Bash o WSL.
+Los comandos son bash. En Windows, usa WSL o Git Bash, o consulta la **versión PowerShell de cada comando** en [GUIA-LOCALSTACK-MANUAL.md](GUIA-LOCALSTACK-MANUAL.md#mac-linux-y-windows-cómo-leer-esta-guía).
 
 ### 3.1 Variables
 ```bash
