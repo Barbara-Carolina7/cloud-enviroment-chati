@@ -2,6 +2,8 @@
 
 Todo con el AWS CLI, **sin los scripts del proyecto**. La idea es que entiendas cada pieza: cómo el CLI sabe si habla con LocalStack o con AWS real, cómo se crean y conectan SNS, SQS y las Lambdas, cómo probar cada tramo, cómo invocar una Lambda a mano y cómo conectar tu servidor. Los comandos son los **mismos** para LocalStack y para AWS real: lo único que cambia es el perfil del CLI y unos pocos valores, que se listan en la [parte 9](#9-pasar-a-aws-real).
 
+**No necesitas clonar ningún repositorio** para las partes 1 a 7: las Lambdas son ejemplos de pocas líneas que se escriben en la propia guía y solo imprimen en consola. El código real del proyecto es opcional (6.8).
+
 **Funciona en Mac, Linux y Windows.** Cada paso trae dos versiones: **bash** (Mac, Linux, WSL, Git Bash) y **PowerShell** (Windows). Léelas en la sección [Mac, Linux y Windows](#mac-linux-y-windows-cómo-leer-esta-guía).
 
 Arquitectura que se construye (detalle en `GUIA.md`):
@@ -21,6 +23,7 @@ SNS report-events ─┬─► SQS report-requests   (+DLQ) ──► Lambda rep
 6. [Lambdas y sus triggers](#6-lambdas-y-sus-triggers)
 7. [Invocar una Lambda a mano y ver sus logs](#7-invocar-una-lambda-a-mano-y-ver-sus-logs)
 8. [Conectar tu servidor a LocalStack](#8-conectar-tu-servidor-a-localstack)
+   - [8.1 Ejemplo mínimo: una API Spring Boot de prueba que envía a SQS](#81-ejemplo-mínimo-una-api-spring-boot-de-prueba-que-envía-a-sqs-sin-autenticación)
 9. [Pasar a AWS real](#9-pasar-a-aws-real)
 10. [Inspeccionar, depurar y limpiar](#10-inspeccionar-depurar-y-limpiar)
 11. [Errores frecuentes](#11-errores-frecuentes)
@@ -62,7 +65,7 @@ SNS report-events ─┬─► SQS report-requests   (+DLQ) ──► Lambda rep
 | `sleep 10` | `Start-Sleep 10` | |
 | `curl` | `curl.exe` | `curl` es un alias de otra cosa en PowerShell 5.1 |
 | `a && b` | `a; b` | `&&` solo existe en PowerShell 7 |
-| `zip` | `tar -a -c -f archivo.zip …` | No hay `zip`; evita `Compress-Archive` (ver parte 6.1) |
+| `zip` | `tar -a -c -f archivo.zip …` | No hay `zip`; evita `Compress-Archive` (ver parte 6.8) |
 | `unset VAR` | `Remove-Item Env:VAR` | |
 
 **Regla de oro en PowerShell:** todo JSON se escribe en un archivo con `Set-Content -Encoding ascii` y se pasa con `file://`. Así funciona igual en PowerShell 5.1 y en 7. (`-Encoding ascii` evita que Windows PowerShell 5.1 agregue una marca BOM al archivo, que algunos parsers rechazan.)
@@ -506,20 +509,60 @@ aws sqs purge-queue --queue-url $GENERATION_URL
 
 ## 6. Lambdas y sus triggers
 
-### 6.1 Empaquetar
-Una Lambda de Node se sube como un `.zip` con el código y sus dependencias (`node_modules`):
+Para no depender de ningún repositorio, esta parte usa **dos Lambdas de ejemplo que solo imprimen en consola** lo que reciben. Se llaman como las reales (`report-request-recorder` y `report-generator`) para que el resto de la guía funcione igual, y ambas ejecutan el mismo código de unas pocas líneas. Al final (6.8) se explica cómo cambiarlas por el código real del proyecto.
+
+### 6.1 El código y el zip
+Una Lambda de Node se sube como un `.zip` con su código. Este ejemplo tiene un solo archivo, sin dependencias, así que no hace falta `npm`:
 
 **bash**
 ```bash
-(cd lambdas/pg/report-request-recorder && npm ci --omit=dev && zip -r ../recorder.zip .)
-(cd lambdas/pg/report-generator        && npm ci --omit=dev && zip -r ../generator.zip .)
+mkdir lambda-demo
+cat > lambda-demo/index.js <<'EOF'
+// Lambda de ejemplo: imprime en la consola cada mensaje que recibe de SQS.
+function leer(texto) {
+  try { return JSON.parse(texto); } catch { return texto; }
+}
+
+exports.handler = async (event) => {
+  const nombre = process.env.AWS_LAMBDA_FUNCTION_NAME;
+  const registros = event.Records || [];
+  for (const registro of registros) {
+    const externo = leer(registro.body);
+    // SNS (sin raw delivery) envuelve el mensaje: {"Type":"Notification","Message":"..."}
+    const mensaje = externo && externo.Message ? leer(externo.Message) : externo;
+    console.log("[" + nombre + "] mensaje recibido:", JSON.stringify(mensaje));
+  }
+  console.log("[" + nombre + "] lote procesado: " + registros.length + " mensaje(s)");
+  return { procesados: registros.length };
+};
+EOF
+(cd lambda-demo && zip ../demo.zip index.js)
 ```
 **PowerShell**
 ```powershell
-Push-Location lambdas/pg/report-request-recorder; npm ci --omit=dev; tar -a -c -f ../recorder.zip *; Pop-Location
-Push-Location lambdas/pg/report-generator;        npm ci --omit=dev; tar -a -c -f ../generator.zip *; Pop-Location
+mkdir lambda-demo
+@'
+// Lambda de ejemplo: imprime en la consola cada mensaje que recibe de SQS.
+function leer(texto) {
+  try { return JSON.parse(texto); } catch { return texto; }
+}
+
+exports.handler = async (event) => {
+  const nombre = process.env.AWS_LAMBDA_FUNCTION_NAME;
+  const registros = event.Records || [];
+  for (const registro of registros) {
+    const externo = leer(registro.body);
+    // SNS (sin raw delivery) envuelve el mensaje: {"Type":"Notification","Message":"..."}
+    const mensaje = externo && externo.Message ? leer(externo.Message) : externo;
+    console.log("[" + nombre + "] mensaje recibido:", JSON.stringify(mensaje));
+  }
+  console.log("[" + nombre + "] lote procesado: " + registros.length + " mensaje(s)");
+  return { procesados: registros.length };
+};
+'@ | Set-Content -Encoding ascii lambda-demo/index.js
+Push-Location lambda-demo; tar -a -c -f ../demo.zip index.js; Pop-Location
 ```
-> **No uses `Compress-Archive` para esto en Windows PowerShell 5.1:** genera zips con `\` como separador de carpetas, y la Lambda (Linux) no encuentra `node_modules/pg/…`. `tar -a -c -f` produce un zip correcto. Con WSL o Git Bash puedes usar `zip` directamente.
+Qué hace el código: recorre `event.Records` (cada mensaje de SQS llega ahí, con su texto en `body`), y si el `body` es el sobre de SNS (`{"Type":"Notification","Message":"…"}`) lo desenvuelve. Imprime cada mensaje con el nombre de la función (`AWS_LAMBDA_FUNCTION_NAME`, que AWS define solo), así sabes cuál de las dos lo recibió.
 
 ### 6.2 El rol
 Toda Lambda se ejecuta con un **rol de IAM**. **LocalStack no valida el rol**: basta con un ARN con la forma correcta, sin crear nada.
@@ -534,59 +577,31 @@ $ROLE_ARN = "arn:aws:iam::${ACCOUNT_ID}:role/lambda-role"
 ```
 En AWS real el rol **sí debe existir**, con permisos. Se explica en la [parte 9](#9-pasar-a-aws-real).
 
-### 6.3 Las variables de entorno
-Se pasan en un archivo, porque las URLs de conexión tienen símbolos que rompen la sintaxis corta del CLI.
-
-**`report-request-recorder`** (guarda la solicitud en Postgres). Dentro del contenedor de la Lambda, `localhost` es el propio contenedor, por eso se usa `host.docker.internal` para alcanzar el Postgres de tu máquina:
-
-**bash**
-```bash
-cat > env-recorder.json <<'EOF'
-{"Variables":{"DATABASE_URL":"postgresql://USUARIO@host.docker.internal:5432/reports_local","DATABASE_SSL":"false"}}
-EOF
-```
-**PowerShell**
-```powershell
-@'
-{"Variables":{"DATABASE_URL":"postgresql://USUARIO@host.docker.internal:5432/reports_local","DATABASE_SSL":"false"}}
-'@ | Set-Content -Encoding ascii env-recorder.json
-```
-**`report-generator`** (lee los productos y publica el aviso). Con `NOTIFY_MODE=log` solo imprime el aviso, sin llamar a la API real:
-
-**bash**
-```bash
-cat > env-generator.json <<'EOF'
-{"Variables":{"DATABASE_URL":"postgresql://USUARIO@host.docker.internal:5432/reports_local","DATABASE_SSL":"false","NOTIFY_MODE":"log"}}
-EOF
-```
-**PowerShell**
-```powershell
-@'
-{"Variables":{"DATABASE_URL":"postgresql://USUARIO@host.docker.internal:5432/reports_local","DATABASE_SSL":"false","NOTIFY_MODE":"log"}}
-'@ | Set-Content -Encoding ascii env-generator.json
-```
-Reemplaza `USUARIO` por tu usuario de Postgres local. Si tu Postgres tiene contraseña: `postgresql://USUARIO:CLAVE@…`.
+### 6.3 Variables de entorno
+Las Lambdas de ejemplo **no necesitan ninguna**. Solo el código real del proyecto las usa (conexión a la base de datos, API de avisos): se explican en la 6.8.
 
 ### 6.4 Crear las funciones
+La misma `demo.zip` sirve para las dos:
+
 **bash**
 ```bash
 aws lambda create-function --function-name report-request-recorder \
   --runtime nodejs20.x --handler index.handler --timeout 15 --memory-size 128 \
-  --role "$ROLE_ARN" --zip-file fileb://lambdas/pg/recorder.zip --environment file://env-recorder.json
+  --role "$ROLE_ARN" --zip-file fileb://demo.zip
 
 aws lambda create-function --function-name report-generator \
   --runtime nodejs20.x --handler index.handler --timeout 15 --memory-size 128 \
-  --role "$ROLE_ARN" --zip-file fileb://lambdas/pg/generator.zip --environment file://env-generator.json
+  --role "$ROLE_ARN" --zip-file fileb://demo.zip
 ```
 **PowerShell**
 ```powershell
 aws lambda create-function --function-name report-request-recorder `
   --runtime nodejs20.x --handler index.handler --timeout 15 --memory-size 128 `
-  --role $ROLE_ARN --zip-file fileb://lambdas/pg/recorder.zip --environment file://env-recorder.json
+  --role $ROLE_ARN --zip-file fileb://demo.zip
 
 aws lambda create-function --function-name report-generator `
   --runtime nodejs20.x --handler index.handler --timeout 15 --memory-size 128 `
-  --role $ROLE_ARN --zip-file fileb://lambdas/pg/generator.zip --environment file://env-generator.json
+  --role $ROLE_ARN --zip-file fileb://demo.zip
 ```
 - `--handler index.handler`: el archivo `index.js` y la función exportada `handler`.
 - `--timeout 15`: máximo 15 s por ejecución (debe ser menor que el `VisibilityTimeout` de la cola).
@@ -623,24 +638,22 @@ Compruébalos (igual en ambos):
 ```
 aws lambda list-event-source-mappings --query 'EventSourceMappings[].[FunctionArn,EventSourceArn,State]' --output table
 ```
-Deben estar `Enabled`. `--batch-size 5` significa que la Lambda recibe hasta 5 mensajes por invocación. Si la Lambda lanza un error, **todo el lote** vuelve a la cola y cuenta como un intento: por eso las Lambdas son idempotentes.
+Deben estar `Enabled`. `--batch-size 5` significa que la Lambda recibe hasta 5 mensajes por invocación. Si la Lambda lanza un error, **todo el lote** vuelve a la cola y cuenta como un intento: por eso las Lambdas reales son idempotentes.
 
-### 6.6 Actualizar el código o las variables
-Tras cambiar el código, no hace falta recrear nada:
+### 6.6 Actualizar el código
+Tras cambiar `lambda-demo/index.js`, vuelve a generar el zip (6.1) y sube el código; no hace falta recrear nada:
 
 **bash**
 ```bash
-aws lambda update-function-code --function-name report-generator --zip-file fileb://lambdas/pg/generator.zip
+aws lambda update-function-code --function-name report-generator --zip-file fileb://demo.zip
 aws lambda wait function-updated --function-name report-generator
-aws lambda update-function-configuration --function-name report-generator --environment file://env-generator.json
 ```
 **PowerShell**
 ```powershell
-aws lambda update-function-code --function-name report-generator --zip-file fileb://lambdas/pg/generator.zip
+aws lambda update-function-code --function-name report-generator --zip-file fileb://demo.zip
 aws lambda wait function-updated --function-name report-generator
-aws lambda update-function-configuration --function-name report-generator --environment file://env-generator.json
 ```
-> `update-function-configuration --environment` **reemplaza todas** las variables, no agrega: siempre envía el conjunto completo.
+Para cambiar las **variables de entorno** se usa `aws lambda update-function-configuration --function-name <nombre> --environment file://env.json`. Ojo: **reemplaza todas** las variables, no agrega: siempre envía el conjunto completo.
 
 ### 6.7 Recrear una Lambda en LocalStack
 Si borras una función y la recreas, borra **antes** su mapeo; si no, LocalStack responde `ResourceConflictException` porque el mapeo viejo sigue existiendo:
@@ -657,6 +670,69 @@ aws lambda list-event-source-mappings --event-source-arn $REQUESTS_ARN --query '
 aws lambda delete-event-source-mapping --uuid <UUID>
 aws lambda delete-function --function-name report-request-recorder
 ```
+
+### 6.8 Opcional: usar el código real del proyecto
+Las Lambdas de ejemplo solo imprimen. Si quieres que guarden la solicitud en Postgres y publiquen el aviso, cambia su código por el de los repositorios (necesitas haberlos clonado, parte 2.2 de `GUIA.md`: la carpeta `lambdas/pg`). Es solo reemplazar el código y agregar las variables que ese código usa; las funciones, colas y triggers no cambian.
+
+**1. Empaquetar** (estas sí tienen dependencias, `pg`):
+
+**bash**
+```bash
+(cd lambdas/pg/report-request-recorder && npm ci --omit=dev && zip -r ../recorder.zip .)
+(cd lambdas/pg/report-generator        && npm ci --omit=dev && zip -r ../generator.zip .)
+```
+**PowerShell**
+```powershell
+Push-Location lambdas/pg/report-request-recorder; npm ci --omit=dev; tar -a -c -f ../recorder.zip *; Pop-Location
+Push-Location lambdas/pg/report-generator;        npm ci --omit=dev; tar -a -c -f ../generator.zip *; Pop-Location
+```
+> **No uses `Compress-Archive` para esto en Windows PowerShell 5.1:** genera zips con `\` como separador de carpetas, y la Lambda (Linux) no encuentra `node_modules/pg/…`. `tar -a -c -f` produce un zip correcto. Con WSL o Git Bash puedes usar `zip` directamente.
+
+**2. Las variables de entorno**, en archivos (las URLs de conexión tienen símbolos que rompen la sintaxis corta del CLI). Dentro del contenedor de la Lambda, `localhost` es el propio contenedor, por eso se usa `host.docker.internal` para alcanzar el Postgres de tu máquina. Con `NOTIFY_MODE=log`, el generador imprime el aviso en vez de llamar a la API real:
+
+**bash**
+```bash
+cat > env-recorder.json <<'EOF'
+{"Variables":{"DATABASE_URL":"postgresql://USUARIO@host.docker.internal:5432/reports_local","DATABASE_SSL":"false"}}
+EOF
+cat > env-generator.json <<'EOF'
+{"Variables":{"DATABASE_URL":"postgresql://USUARIO@host.docker.internal:5432/reports_local","DATABASE_SSL":"false","NOTIFY_MODE":"log"}}
+EOF
+```
+**PowerShell**
+```powershell
+@'
+{"Variables":{"DATABASE_URL":"postgresql://USUARIO@host.docker.internal:5432/reports_local","DATABASE_SSL":"false"}}
+'@ | Set-Content -Encoding ascii env-recorder.json
+@'
+{"Variables":{"DATABASE_URL":"postgresql://USUARIO@host.docker.internal:5432/reports_local","DATABASE_SSL":"false","NOTIFY_MODE":"log"}}
+'@ | Set-Content -Encoding ascii env-generator.json
+```
+Reemplaza `USUARIO` por tu usuario de Postgres local. Si tu Postgres tiene contraseña: `postgresql://USUARIO:CLAVE@…`.
+
+**3. Reemplazar el código y las variables:**
+
+**bash**
+```bash
+aws lambda update-function-code --function-name report-request-recorder --zip-file fileb://lambdas/pg/recorder.zip
+aws lambda wait function-updated --function-name report-request-recorder
+aws lambda update-function-configuration --function-name report-request-recorder --environment file://env-recorder.json
+
+aws lambda update-function-code --function-name report-generator --zip-file fileb://lambdas/pg/generator.zip
+aws lambda wait function-updated --function-name report-generator
+aws lambda update-function-configuration --function-name report-generator --environment file://env-generator.json
+```
+**PowerShell**
+```powershell
+aws lambda update-function-code --function-name report-request-recorder --zip-file fileb://lambdas/pg/recorder.zip
+aws lambda wait function-updated --function-name report-request-recorder
+aws lambda update-function-configuration --function-name report-request-recorder --environment file://env-recorder.json
+
+aws lambda update-function-code --function-name report-generator --zip-file fileb://lambdas/pg/generator.zip
+aws lambda wait function-updated --function-name report-generator
+aws lambda update-function-configuration --function-name report-generator --environment file://env-generator.json
+```
+Con el código real, el recorder necesita la tabla `report_requests` (SQL en `GUIA.md`, parte 1) y que Postgres acepte conexiones desde Docker; el generador, la tabla `products`. En AWS real las variables cambian (parte 9).
 
 ---
 
@@ -716,7 +792,14 @@ aws sns publish --topic-arn "$TOPIC_ARN" --message '{"type":"report.requested","
 '@ | Set-Content -Encoding ascii msg-flujo.json
 aws sns publish --topic-arn $TOPIC_ARN --message file://msg-flujo.json
 ```
-Espera unos segundos y mira los logs.
+Espera unos segundos y mira los logs (7.3). Con las Lambdas de ejemplo, **cada una imprime el mensaje**, porque el filtro lo deja pasar a las dos colas:
+```
+[report-request-recorder] mensaje recibido: {"type":"report.requested","body":{"requestId":"flujo-1",…}}
+[report-request-recorder] lote procesado: 1 mensaje(s)
+
+[report-generator] mensaje recibido: {"type":"report.requested","body":{"requestId":"flujo-1",…}}
+[report-generator] lote procesado: 1 mensaje(s)
+```
 
 ### 7.3 Logs
 Cada Lambda escribe en el grupo `/aws/lambda/<nombre>` (mismo comando en ambos):
@@ -730,7 +813,7 @@ aws logs filter-log-events --log-group-name /aws/lambda/report-generator --query
 ```
 > **No uses `--filter-pattern` en LocalStack:** no se aplica de forma fiable y devuelve todos los eventos, incluidos los de ejecuciones anteriores. Para encontrar una ejecución concreta, filtra con `grep` (o `Select-String`) por un dato único (el `requestId` del mensaje).
 
-Y verifica en la base que el recorder guardó la fila (necesita `psql` en el PATH; en Windows, instala el cliente de PostgreSQL, o usa pgAdmin / DBeaver):
+Con las Lambdas de ejemplo, la prueba es que el mensaje **aparezca impreso en el log** de cada una (ver 7.2). Si usas el código real (6.8), verifica además en la base que el recorder guardó la fila (necesita `psql` en el PATH; en Windows, instala el cliente de PostgreSQL, o usa pgAdmin / DBeaver):
 ```
 psql reports_local -P pager=off -c "SELECT id, requester, type, requested_at FROM report_requests ORDER BY requested_at DESC LIMIT 3;"
 ```
@@ -802,6 +885,288 @@ Debe responder `202 Accepted` con un `requestId`.
 
 **Qué NO debe llegar nunca a producción:** `AWS_ENDPOINT_URL`, las claves `test`, `NOTIFY_MODE=log`, `DATABASE_SSL=false` y el `…ISSUER_URI` local. En el despliegue real, el contenedor del BFF se inicia sin ellas (mira `deploy.yml`: solo define las de producción).
 
+### 8.1 Ejemplo mínimo: una API Spring Boot de prueba que envía a SQS (sin autenticación)
+Una API de unas 25 líneas, **sin Spring Security, sin Cognito y sin nada**, con un solo endpoint: lo que recibes en el cuerpo se envía tal cual a una cola de SQS. Sirve para ver de punta a punta cómo un servidor Java publica en SQS contra LocalStack, y cómo cambiaría para AWS real.
+
+> **Solo para pruebas.** Un endpoint abierto que escribe en una cola es un agujero de seguridad. Esta API escucha únicamente en `127.0.0.1` (tu máquina) y usa el puerto 8081 para no chocar con el BFF (8080). **No la despliegues así.**
+
+Requisitos: Java 21 y que LocalStack esté arriba con tu perfil activo (partes 2 y 3).
+
+**1. Una cola de destino.** Una cola nueva y sin Lambda conectada, para poder leer el mensaje de vuelta:
+
+**bash**
+```bash
+TEST_QUEUE_URL=$(aws sqs create-queue --queue-name test-api-queue --query QueueUrl --output text)
+echo "$TEST_QUEUE_URL"
+```
+**PowerShell**
+```powershell
+$TEST_QUEUE_URL = aws sqs create-queue --queue-name test-api-queue --query QueueUrl --output text
+$TEST_QUEUE_URL
+```
+
+**2. Generar el proyecto con Spring Initializr** (la herramienta oficial de Spring para crear proyectos; aquí por línea de comandos, con la dependencia web):
+
+**bash**
+```bash
+curl -s https://start.spring.io/starter.zip \
+  -d type=gradle-project -d language=java -d javaVersion=21 \
+  -d groupId=com.example -d artifactId=sqs-test-api -d name=sqs-test-api \
+  -d packageName=com.example.sqstest -d dependencies=web \
+  -o sqs-test-api.zip
+mkdir sqs-test-api && unzip -q sqs-test-api.zip -d sqs-test-api
+cd sqs-test-api
+```
+**PowerShell**
+```powershell
+curl.exe -s https://start.spring.io/starter.zip `
+  -d type=gradle-project -d language=java -d javaVersion=21 `
+  -d groupId=com.example -d artifactId=sqs-test-api -d name=sqs-test-api `
+  -d packageName=com.example.sqstest -d dependencies=web `
+  -o sqs-test-api.zip
+mkdir sqs-test-api; tar -xf sqs-test-api.zip -C sqs-test-api
+cd sqs-test-api
+```
+Si prefieres una interfaz gráfica, https://start.spring.io ofrece lo mismo: proyecto Gradle (Groovy), Java 21, dependencia "Spring Web".
+
+**3. Agregar el SDK de AWS para SQS.** El proyecto generado no lo trae. Se agrega al final de `build.gradle`; el *BOM* (`platform`) fija las versiones de todos los módulos del SDK:
+
+**bash**
+```bash
+cat >> build.gradle <<'EOF'
+
+dependencies {
+    implementation platform('software.amazon.awssdk:bom:2.29.52')
+    implementation 'software.amazon.awssdk:sqs'
+}
+EOF
+```
+**PowerShell**
+```powershell
+@'
+
+dependencies {
+    implementation platform('software.amazon.awssdk:bom:2.29.52')
+    implementation 'software.amazon.awssdk:sqs'
+}
+'@ | Add-Content -Encoding ascii build.gradle
+```
+
+**4. El código: un cliente de SQS y un endpoint.**
+
+**bash**
+```bash
+cat > src/main/java/com/example/sqstest/SqsConfig.java <<'EOF'
+package com.example.sqstest;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import software.amazon.awssdk.services.sqs.SqsClient;
+
+@Configuration
+public class SqsConfig {
+
+    // Sin región, claves ni endpoint en el código: todo sale del entorno (AWS_REGION, credenciales y
+    // AWS_ENDPOINT_URL). Por eso el mismo código sirve para LocalStack y para AWS real.
+    @Bean
+    public SqsClient sqsClient() {
+        return SqsClient.create();
+    }
+}
+EOF
+
+cat > src/main/java/com/example/sqstest/SqsTestController.java <<'EOF'
+package com.example.sqstest;
+
+import java.util.Map;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
+
+@RestController
+@RequestMapping("/api/test")
+public class SqsTestController {
+
+    private final SqsClient sqs;
+    private final String queueUrl;
+
+    public SqsTestController(SqsClient sqs, @Value("${app.sqs.queue-url}") String queueUrl) {
+        this.sqs = sqs;
+        this.queueUrl = queueUrl;
+    }
+
+    // Lo que llegue en el cuerpo se envía tal cual a la cola.
+    @PostMapping("/sqs")
+    public ResponseEntity<Map<String, String>> send(@RequestBody String body) {
+        String messageId = sqs.sendMessage(SendMessageRequest.builder()
+                .queueUrl(queueUrl)
+                .messageBody(body)
+                .build()).messageId();
+        return ResponseEntity.accepted().body(Map.of("messageId", messageId, "queueUrl", queueUrl));
+    }
+}
+EOF
+
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=sqs-test-api
+server.port=8081
+server.address=127.0.0.1
+app.sqs.queue-url=${SQS_QUEUE_URL}
+EOF
+```
+**PowerShell**
+```powershell
+@'
+package com.example.sqstest;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import software.amazon.awssdk.services.sqs.SqsClient;
+
+@Configuration
+public class SqsConfig {
+
+    // Sin región, claves ni endpoint en el código: todo sale del entorno (AWS_REGION, credenciales y
+    // AWS_ENDPOINT_URL). Por eso el mismo código sirve para LocalStack y para AWS real.
+    @Bean
+    public SqsClient sqsClient() {
+        return SqsClient.create();
+    }
+}
+'@ | Set-Content -Encoding ascii src/main/java/com/example/sqstest/SqsConfig.java
+
+@'
+package com.example.sqstest;
+
+import java.util.Map;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
+
+@RestController
+@RequestMapping("/api/test")
+public class SqsTestController {
+
+    private final SqsClient sqs;
+    private final String queueUrl;
+
+    public SqsTestController(SqsClient sqs, @Value("${app.sqs.queue-url}") String queueUrl) {
+        this.sqs = sqs;
+        this.queueUrl = queueUrl;
+    }
+
+    // Lo que llegue en el cuerpo se envía tal cual a la cola.
+    @PostMapping("/sqs")
+    public ResponseEntity<Map<String, String>> send(@RequestBody String body) {
+        String messageId = sqs.sendMessage(SendMessageRequest.builder()
+                .queueUrl(queueUrl)
+                .messageBody(body)
+                .build()).messageId();
+        return ResponseEntity.accepted().body(Map.of("messageId", messageId, "queueUrl", queueUrl));
+    }
+}
+'@ | Set-Content -Encoding ascii src/main/java/com/example/sqstest/SqsTestController.java
+
+@'
+spring.application.name=sqs-test-api
+server.port=8081
+server.address=127.0.0.1
+app.sqs.queue-url=${SQS_QUEUE_URL}
+'@ | Set-Content -Encoding ascii src/main/resources/application.properties
+```
+- **`SqsClient.create()`** no recibe nada: el SDK busca por sí solo la región (`AWS_REGION`), las credenciales y, desde la versión 2.21, el endpoint (`AWS_ENDPOINT_URL`). Es lo que permite cambiar de LocalStack a AWS real sin tocar el código.
+- **`@RequestBody String`** recibe el cuerpo crudo, sin interpretarlo como JSON: así la API no necesita ninguna librería de JSON y envía exactamente lo que le mandes.
+- **`server.address=127.0.0.1`** hace que solo tu máquina pueda llamarla.
+
+**5. Arrancarla**, apuntando a LocalStack y a la cola. Hazlo **en la misma terminal del paso 1**, donde existe `TEST_QUEUE_URL`. Es un proceso que no termina: déjalo corriendo y abre otra terminal para el paso siguiente (la primera vez Gradle descarga sus dependencias y puede tardar):
+
+**bash**
+```bash
+AWS_ENDPOINT_URL=http://localhost:4566 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+AWS_REGION=us-east-2 SQS_QUEUE_URL="$TEST_QUEUE_URL" \
+./gradlew bootRun
+```
+**PowerShell**
+```powershell
+$env:AWS_ENDPOINT_URL = "http://localhost:4566"
+$env:AWS_ACCESS_KEY_ID = "test"
+$env:AWS_SECRET_ACCESS_KEY = "test"
+$env:AWS_REGION = "us-east-2"
+$env:SQS_QUEUE_URL = $TEST_QUEUE_URL
+.\gradlew.bat bootRun
+```
+Cuando veas `Started SqsTestApiApplication in … seconds`, está lista (en la prueba, en menos de un segundo de arranque propio, más unos segundos de compilación). **Comprueba que `SQS_QUEUE_URL` no esté vacía:** si esa variable no existe en tu terminal, la API arranca igual, pero cada llamada falla con un 500 engañoso (`QueueDoesNotExistException`) porque pide una cola con nombre vacío. (Si usas otra terminal para el paso 6, tendrá que tener de nuevo el perfil `localstack` activo y la variable `TEST_QUEUE_URL`; si no, repite `export AWS_PROFILE=localstack` y vuelve a pedir la URL con `aws sqs get-queue-url --queue-name test-api-queue --query QueueUrl --output text`.)
+
+**6. Llamar al endpoint y ver llegar el mensaje.** En otra terminal:
+
+**bash**
+```bash
+curl -i -X POST http://localhost:8081/api/test/sqs \
+  -H "Content-Type: application/json" \
+  -d '{"hola":"desde spring"}'
+
+aws sqs receive-message --queue-url "$TEST_QUEUE_URL" --wait-time-seconds 3
+```
+**PowerShell**
+```powershell
+'{"hola":"desde spring"}' | Set-Content -Encoding ascii body.json
+curl.exe -i -X POST http://localhost:8081/api/test/sqs `
+  -H "Content-Type: application/json" `
+  --data "@body.json"
+
+aws sqs receive-message --queue-url $TEST_QUEUE_URL --wait-time-seconds 3
+```
+Esta secuencia se probó contra LocalStack 3.8.1 con Spring Boot 4.1.1 y el SDK de AWS 2.29.52. Salida esperada:
+```
+HTTP/1.1 202
+Content-Type: application/json
+
+{"messageId":"8fc0a614-86df-41fa-8031-81f923562dde","queueUrl":"http://sqs.us-east-2.localhost.localstack.cloud:4566/000000000000/test-api-queue"}
+```
+y `receive-message`:
+```
+{"Messages": [{"MessageId": "8fc0a614-…", "Body": "{\"hola\":\"desde spring\"}", …}]}
+```
+Esa es la prueba de que el servidor llegó a LocalStack y escribió en la cola. Observa que el `messageId` de la respuesta de la API es el mismo que el de `receive-message`.
+
+Si quieres ver exactamente qué envía el SDK de AWS, arranca la API con `LOGGING_LEVEL_SOFTWARE_AMAZON_AWSSDK_REQUEST=DEBUG` (variable de entorno): el log mostrará `Sending Request: … host=localhost, port=4566` y `Received successful response: 200`.
+
+**7. Enviar al flujo real del proyecto.** Si en lugar de `test-api-queue` apuntas la API a `report-requests` (la cola de la parte 4, con su Lambda conectada), el mensaje dispara a `report-request-recorder`. Detén la API (Ctrl+C), arráncala de nuevo con `SQS_QUEUE_URL` igual a la URL de `report-requests` (en bash `"$REQUESTS_URL"`; en PowerShell `$REQUESTS_URL`), y envía un mensaje con la forma que esperan las Lambdas (el mismo de las partes 5 y 7):
+```
+{"type":"report.requested","body":{"requestId":"api-1","requester":"yo@ejemplo.com","requesterId":"s1","reportType":"INVENTORY","params":{},"requestedAt":"2026-01-01T00:00:00Z"}}
+```
+Ten presente que **este camino se salta SNS**: el mensaje va solo a esa cola, no a las dos. Las Lambdas aceptan el mensaje directo (sin el sobre de SNS), por eso funciona. Revisa el resultado en los logs de la Lambda (parte 7.3) o con `psql` (parte 7.3).
+
+**8. Limpiar.** Detén la API con Ctrl+C y borra la cola y el proyecto:
+
+**bash**
+```bash
+aws sqs delete-queue --queue-url "$TEST_QUEUE_URL"
+cd .. && rm -rf sqs-test-api sqs-test-api.zip
+```
+**PowerShell**
+```powershell
+aws sqs delete-queue --queue-url $TEST_QUEUE_URL
+cd ..; Remove-Item -Recurse -Force sqs-test-api, sqs-test-api.zip
+```
+
+**Para AWS real, esta API cambiaría así** (el código no):
+- **Se quitan** `AWS_ENDPOINT_URL` y las claves `test`: el servidor usa el rol de la instancia EC2.
+- **`SQS_QUEUE_URL`** pasa a ser la URL real de la cola (`aws sqs get-queue-url --queue-name <cola>`).
+- **El rol necesita permiso** `sqs:SendMessage` sobre esa cola (como el `sns:Publish` de la parte 9.3).
+- **El endpoint no puede quedar abierto:** en un servidor real iría detrás de autenticación (Cognito en el BFF del proyecto). Esta versión es solo un banco de pruebas.
+- Si prefieres publicar en **SNS** (como hace el BFF) en vez de enviar a una cola, se cambia `SqsClient` por `SnsClient` (módulo `sns`) y `sendMessage` por `publish` con el `TopicArn`: así el mensaje llega a las dos colas con su filtro.
+
 ---
 
 ## 9. Pasar a AWS real
@@ -872,7 +1237,7 @@ foreach ($p in $pares) {
 }
 Start-Sleep 12    # el rol tarda unos segundos en propagarse; sin esperar, create-function puede fallar
 ```
-Y en la parte 6.4, usa `--role "arn:aws:iam::${ACCOUNT_ID}:role/report-request-recorder-role"` (y `…/report-generator-role` para el otro), con `--runtime nodejs22.x` y las variables reales.
+Y en la parte 6.4, usa `--role "arn:aws:iam::${ACCOUNT_ID}:role/report-request-recorder-role"` (y `…/report-generator-role` para el otro), con `--runtime nodejs22.x`. Si usas el código real, las variables de producción son las de la parte 6.8 con los valores reales (9.2).
 
 ### 9.2 Variables del generador en real
 **bash**
@@ -985,9 +1350,10 @@ aws sns delete-topic --topic-arn <TOPIC_ARN>
 | `ResourceConflictException` al crear un mapeo | Quedó un mapeo anterior | Borrarlo (parte 6.7) |
 | `InvalidParameterValueException: The role defined for the function cannot be assumed` (AWS real) | El rol no existe o aún no se propaga | Crear el rol (9.1) y esperar 10 segundos |
 | El mensaje no llega a una cola | El filtro no coincide, o falta la política de la cola | `receive-message` de la parte 5; revisa el `type` y el scope `MessageBody` |
-| La Lambda falla con `ECONNREFUSED` al conectarse a Postgres (local) | Usa `localhost`, que dentro del contenedor es él mismo | `host.docker.internal` en `DATABASE_URL` |
-| La Lambda falla con `no pg_hba.conf entry` o por SSL (local) | Postgres local no usa SSL | `DATABASE_SSL=false` |
-| `relation "report_requests" does not exist` | La tabla aún no existe | Crearla con el SQL de `GUIA.md` (parte 1), o arrancar el BFF |
+| (código real, 6.8) La Lambda falla con `ECONNREFUSED` al conectarse a Postgres (local) | Usa `localhost`, que dentro del contenedor es él mismo | `host.docker.internal` en `DATABASE_URL` |
+| (código real, 6.8) La Lambda falla con `no pg_hba.conf entry` o por SSL (local) | Postgres local no usa SSL | `DATABASE_SSL=false` |
+| (código real, 6.8) `relation "report_requests" does not exist` | La tabla aún no existe | Crearla con el SQL de `GUIA.md` (parte 1), o arrancar el BFF |
+| La API Spring Boot responde `500` y su log dice `QueueDoesNotExistException` | `SQS_QUEUE_URL` está vacía (la variable `TEST_QUEUE_URL` no existía en esa terminal) o apunta a una cola borrada | Definir la variable en esa terminal (`aws sqs get-queue-url --queue-name test-api-queue --query QueueUrl --output text`) y reiniciar la API |
 | El mensaje reaparece en la cola una y otra vez | La Lambda lanza un error | `aws logs tail` y corregir; tras 3 intentos va a la DLQ |
 | `sqs receive-message` devuelve vacío tras publicar | Aún no llegó, o ya lo consumió una Lambda | Prueba antes de crear los mapeos (parte 5) |
 | **Windows (Git Bash):** `--log-group-name` falla con una ruta `C:/Program Files/Git/…` | Git Bash convierte argumentos que empiezan con `/` | `export MSYS_NO_PATHCONV=1` |
